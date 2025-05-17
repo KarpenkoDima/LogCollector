@@ -3,6 +3,7 @@ using LogCollector.Core.Interfaces;
 using LogCollector.Core.Models;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using System.Threading.Channels;
 
 namespace LogCollector.Application.Services;
 
@@ -14,29 +15,34 @@ public sealed class BatchWriteService : BackgroundService
 
     private const int BatchSize = 500;
     private static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(5);
-    public BatchWriteService(LogChannel channel, ILogRepository repository, ILogger<BatchWriteService> logger)
+    public BatchWriteService(
+        LogChannel channel, 
+        ILogRepository repository, 
+        ILogger<BatchWriteService> logger)        
     {
         _channel = channel;
         _repository = repository;
-        _logger = logger;
+        _logger = logger;       
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var batch = new List<LogEntry>(BatchSize);
-
+      
         while (false == stoppingToken.IsCancellationRequested)
         {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, CancellationToken.None);
+        cts.CancelAfter(FlushInterval);
             try
             {
-                await FillBatchAsync(batch, stoppingToken);
+                await FillBatchAsync(batch, cts.Token);
 
                 if (batch.Count == 0)
                 {
                     continue;
                 }
 
-                var written = await _repository.InsertBatchAsync(batch, stoppingToken);
+                var written = await _repository.InsertBatchAsync(batch, cts.Token);
                 _logger.LogDebug("Flushed {Count} log entries to DB", written);
             }
             catch (OperationCanceledException) { break; }
@@ -46,6 +52,8 @@ public sealed class BatchWriteService : BackgroundService
             }
             finally
             {
+                // TODO:  Реализуйте политику повторных попыток (Retry Policy)
+                // или механизм Dead Letter Queue.    
                 batch.Clear();
             }
         }
@@ -55,9 +63,9 @@ public sealed class BatchWriteService : BackgroundService
 
     private async Task DrainRemainingAsync(List<LogEntry> batch, CancellationToken stoppingToken)
     {
-        while (_channel.Reader.TryRead(out var enrty))
+        while (_channel.Reader.TryRead(out var entry))
         {
-            batch.Add(enrty);
+            batch.Add(entry);
         }
 
         if (batch.Count > 0)
@@ -69,30 +77,38 @@ public sealed class BatchWriteService : BackgroundService
 
     private async Task FillBatchAsync(List<LogEntry> batch, CancellationToken stoppingToken)
     {
-        var entry = await _channel.Reader.ReadAsync(stoppingToken);
-        batch.Add(entry);
-
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, CancellationToken.None);
-        cts.CancelAfter(FlushInterval);
-
-        while(batch.Count < BatchSize && 
-            false == cts.Token.IsCancellationRequested)
+        try
         {
-            if (false == _channel.Reader.TryRead(out entry))
+            // 1. Initial wait: Don't start a batch until there is at least one item.
+            var firstEntry = await _channel.Reader.ReadAsync(stoppingToken);
+            batch.Add(firstEntry);
+
+            // 2. Fill the rest of the batch greedily
+            while (batch.Count < BatchSize)
             {
-                try
+                // Try to pull items that are already sitting in the buffer
+                if (_channel.Reader.TryRead(out var entry))
                 {
-                    await _channel.Reader.WaitToReadAsync(cts.Token);
+                    batch.Add(entry);
                 }
-                catch (OperationCanceledException)
+                else
                 {
-                    break;
+                    // Buffer is empty. Wait for more, or exit if the Channel is closed.
+                    if (false == await _channel.Reader.WaitToReadAsync(stoppingToken))
+                    {
+                        // Channel was marked as Complete and is empty
+                        break;
+                    }
                 }
             }
-            else
-            {
-                batch.Add(entry);
-            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown behavior; the batch gathered so far is still in the 'batch' list
+        }
+        catch(ChannelClosedException)
+        {
+            // Channel was closed while we were reading
         }
     }
 }

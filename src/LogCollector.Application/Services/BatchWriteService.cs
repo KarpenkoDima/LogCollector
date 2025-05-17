@@ -1,14 +1,17 @@
 ﻿using LogCollector.Application.Channels;
+using LogCollector.Application.Options;
 using LogCollector.Core.Interfaces;
 using LogCollector.Core.Models;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using System.Threading.Channels;
 
 namespace LogCollector.Application.Services;
 
 public sealed class BatchWriteService : BackgroundService
 {
+    private readonly LogCollectorOptions _logOptions;
     private readonly LogChannel _channel;
     private readonly ILogRepository _repository;
     private readonly ILogger<BatchWriteService> _logger;
@@ -18,11 +21,13 @@ public sealed class BatchWriteService : BackgroundService
     public BatchWriteService(
         LogChannel channel, 
         ILogRepository repository, 
-        ILogger<BatchWriteService> logger)        
+        ILogger<BatchWriteService> logger,
+        IOptions<LogCollectorOptions> options)
     {
         _channel = channel;
         _repository = repository;
         _logger = logger;       
+        _logOptions = options.Value;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -32,7 +37,7 @@ public sealed class BatchWriteService : BackgroundService
         while (false == stoppingToken.IsCancellationRequested)
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, CancellationToken.None);
-        cts.CancelAfter(FlushInterval);
+        cts.CancelAfter(TimeSpan.FromSeconds(_logOptions.FlushInterval));
             try
             {
                 await FillBatchAsync(batch, cts.Token);
@@ -84,7 +89,7 @@ public sealed class BatchWriteService : BackgroundService
             batch.Add(firstEntry);
 
             // 2. Fill the rest of the batch greedily
-            while (batch.Count < BatchSize)
+            while (batch.Count < _logOptions.BatchSize)
             {
                 // Try to pull items that are already sitting in the buffer
                 if (_channel.Reader.TryRead(out var entry))

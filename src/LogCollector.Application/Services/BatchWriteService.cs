@@ -46,8 +46,8 @@ public sealed class BatchWriteService : BackgroundService
                 {
                     continue;
                 }
-
-                var written = await _repository.InsertBatchAsync(batch, cts.Token);
+                // FIX: Pass stoppingToken, but does not cts.Token!
+                var written = await _repository.InsertBatchAsync(batch, stoppingToken);
                 _logger.LogDebug("Flushed {Count} log entries to DB", written);
             }
             catch (OperationCanceledException) { break; }

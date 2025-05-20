@@ -31,11 +31,13 @@ public sealed class BatchWriteService : BackgroundService
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        var batch = new List<LogEntry>(BatchSize);
+    {       
       
         while (false == stoppingToken.IsCancellationRequested)
         {
+            // Create list of batch in inner while
+            // Now each send to the database requires its own independent object
+            var batch = new List<LogEntry>(BatchSize);
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, CancellationToken.None);
         cts.CancelAfter(TimeSpan.FromSeconds(_logOptions.FlushInterval));
             try
@@ -55,15 +57,17 @@ public sealed class BatchWriteService : BackgroundService
             {
                 _logger.LogError(ex, "Batch write failed, entries will be lost");
             }
-            finally
+          /*  finally
             {
                 // TODO:  Реализуйте политику повторных попыток (Retry Policy)
                 // или механизм Dead Letter Queue.    
                 batch.Clear();
-            }
+            }*/
         }
 
-        await DrainRemainingAsync(batch, stoppingToken);
+        // Fo final flush create new batch of list
+        var finalBatch = new List<LogEntry>(BatchSize);
+        await DrainRemainingAsync(finalBatch, stoppingToken);
     }
 
     private async Task DrainRemainingAsync(List<LogEntry> batch, CancellationToken stoppingToken)

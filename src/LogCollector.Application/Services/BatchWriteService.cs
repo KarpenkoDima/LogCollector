@@ -16,8 +16,6 @@ public sealed class BatchWriteService : BackgroundService
     private readonly ILogRepository _repository;
     private readonly ILogger<BatchWriteService> _logger;
 
-    private const int BatchSize = 500;
-    private static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(5);
     public BatchWriteService(
         LogChannel channel, 
         ILogRepository repository, 
@@ -31,14 +29,14 @@ public sealed class BatchWriteService : BackgroundService
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {       
-      
+    {
+        // убираем Allocation on GC
+        var batch = new List<LogEntry>(_logOptions.BatchSize);
+
         while (false == stoppingToken.IsCancellationRequested)
         {
-            // Create list of batch in inner while
-            // Now each send to the database requires its own independent object
-            var batch = new List<LogEntry>(BatchSize);
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, CancellationToken.None);
+            // ❌ batch.Clear() ЗДЕСЬ ОЧИЩАТЬ  НЕЛЬЗЯ из-за риска дублирования при выходе из цикла   
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         cts.CancelAfter(TimeSpan.FromSeconds(_logOptions.FlushInterval));
             try
             {
@@ -51,11 +49,16 @@ public sealed class BatchWriteService : BackgroundService
                 // FIX: Pass stoppingToken, but does not cts.Token!
                 var written = await _repository.InsertBatchAsync(batch, stoppingToken);
                 _logger.LogDebug("Flushed {Count} log entries to DB", written);
+                // ✅ ОЧИЩАЕМ ЗДЕСЬ! 
+                // Если запись прошла успешно, список нам больше не нужен.
+                // Если же выключение произойдет после этой строки, в DrainRemainingAsync уйдет пустой список.
+                batch.Clear();
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Batch write failed, entries will be lost");
+                batch.Clear();
             }
           /*  finally
             {
@@ -65,9 +68,8 @@ public sealed class BatchWriteService : BackgroundService
             }*/
         }
 
-        // Fo final flush create new batch of list
-        var finalBatch = new List<LogEntry>(BatchSize);
-        await DrainRemainingAsync(finalBatch, stoppingToken);
+        // Дописываем хвостик из batch плюс то что осталось в channel
+        await DrainRemainingAsync(batch, stoppingToken);
     }
 
     private async Task DrainRemainingAsync(List<LogEntry> batch, CancellationToken stoppingToken)
@@ -79,6 +81,8 @@ public sealed class BatchWriteService : BackgroundService
 
         if (batch.Count > 0)
         {
+            // CancellationToken.None — намеренно: stoppingToken уже отменён,
+            // но финальный flush мы обязаны довести до конца.
             await _repository.InsertBatchAsync(batch, CancellationToken.None);
             _logger.LogInformation("Final flush: {Count} entries", batch.Count);
         }

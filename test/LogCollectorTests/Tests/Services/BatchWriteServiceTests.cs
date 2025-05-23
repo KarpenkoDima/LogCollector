@@ -27,29 +27,7 @@ public class BatchWriteServiceTests
             FlushInterval=1,
         };
     }
-
-    private static async Task WaitUntilAsync(
-        Func<bool> continuation,
-        string timeoutMessage,
-        TimeSpan? timeout=null
-        )
-    {
-        var deadline = DateTime.UtcNow + (timeout ??  TimeSpan.FromSeconds(50));
-
-        while (DateTime.UtcNow < deadline)
-        {
-            if (continuation())
-            {
-                return;
-            }
-
-            await Task.Delay(50);
-        }
-
-        throw new TimeoutException(timeoutMessage);
-
-    }
-
+        
     private BatchWriteService CreateService(int timeoutInSeconds = 1)
     {
         _testOptions.FlushInterval = timeoutInSeconds;
@@ -121,19 +99,65 @@ public class BatchWriteServiceTests
         Assert.Equal(3, actualBatcCount);
     }
     [Fact]
-    public async Task ExecuteAsync_WhenRepositoryThrpws_ShouldNotCrash()
+    public async Task ExecuteAsync_WhenRepositoryThrows_ShouldNotCrash()
     {
         // Arrange
+        var firstCallTcs = new TaskCompletionSource();
+        var secondCallTcs = new TaskCompletionSource();
+
         var service = CreateService(timeoutInSeconds: 10);
         using var cts = new CancellationTokenSource();
 
-        // Starting service in background
-        var executeTask = service.StartAsync(cts.Token);
-
         // Settings mock that first record it call error
-        _repositoryMock.SetupSequence(r => r.InsertBatchAsync(It.IsAny<IReadOnlyList<LogEntry>>(), It.IsAny<CancellationToken>()))
-            .ThrowsAsync(new Exception("Database is down"))
-            .ReturnsAsync(1);
+        _repositoryMock.SetupSequence(r => r.InsertBatchAsync(
+            It.IsAny<IReadOnlyList<LogEntry>>(),
+            It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                firstCallTcs.TrySetResult();
+                throw new Exception("Database is down");
+                return 0;
+            }).Returns(async () =>
+            {
+                secondCallTcs.TrySetResult();              
+                return 3;
+            });
 
+
+        await service.StartAsync(cts.Token);
+
+        // Act: first batch - will fall
+        for (int i = 0; i < 3; i++)
+        {
+            await _channel.Writer.WriteAsync(new LogEntry
+            {
+                Level = "Low",
+                Message = $"Log {i}",
+                Source = "MikroTik",
+                Timestamp = DateTime.UtcNow
+            });
+        }
+        await firstCallTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        for (int i = 0; i < 3; i++)
+        {
+            await _channel.Writer.WriteAsync(new LogEntry
+            {
+                Level = "Low",
+                Message = $"Log {i}",
+                Source = "MikroTik",
+                Timestamp = DateTime.UtcNow
+            });
+        }
+
+        await secondCallTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await cts.CancelAsync();
+        await service.StopAsync(CancellationToken.None);
+
+        // Assert: service stay alive and processed two batches
+        _repositoryMock.Verify(r => r.InsertBatchAsync(
+            It.IsAny<IReadOnlyList<LogEntry>>(),
+            It.IsAny<CancellationToken>()), 
+            Times.Exactly(2));
     }
 }

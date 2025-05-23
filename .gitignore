@@ -486,3 +486,5 @@ $RECYCLE.BIN/
 # my files
 *.ps1
 .git_current_date
+# log files
+log[s].db

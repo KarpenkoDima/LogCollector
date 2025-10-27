@@ -6,6 +6,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Threading.Channels;
+using System.Xml;
 
 namespace LogCollector.Application.Services;
 
@@ -15,6 +16,11 @@ public sealed class BatchWriteService : BackgroundService
     private readonly LogChannel _channel;
     private readonly ILogRepository _repository;
     private readonly ILogger<BatchWriteService> _logger;
+
+
+    // Linger-еаймер. Один на весь сервис, переиспользуется через TryReset().
+    // Доступ - только из потока ExecuteAsync(), поэтому ни volatile ни intelocked не нужны.
+    private CancellationTokenSource _lingerCts = null;
 
     public BatchWriteService(
         LogChannel channel, 
@@ -28,100 +34,185 @@ public sealed class BatchWriteService : BackgroundService
         _logOptions = options.Value;
     }
 
+    // Dispose() намеренно не переопределён: единственный disposable-ресурс
+    // (_lingerCts) освобождается в finally ExecuteAsync, гонок с хостом нет.
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // убираем Allocation on GC
+        // Батч аллоцируется один раз и переиспользуется: Clear() сохраняет capacity,
+        // внутренний массив не пересоздаётся.
         var batch = new List<LogEntry>(_logOptions.BatchSize);
 
-        while (false == stoppingToken.IsCancellationRequested)
-        {
-            // ❌ batch.Clear() ЗДЕСЬ ОЧИЩАТЬ  НЕЛЬЗЯ из-за риска дублирования при выходе из цикла   
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-        cts.CancelAfter(TimeSpan.FromSeconds(_logOptions.FlushInterval));
-            try
-            {
-                await FillBatchAsync(batch, cts.Token);
+        _lingerCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
 
-                if (batch.Count == 0)
+        try
+        {
+            bool channelAlive = true;
+            while (channelAlive && false == stoppingToken.IsCancellationRequested)
+            {
+                channelAlive = await FillBatchAsync(batch, stoppingToken);
+
+                if (batch.Count > 0)
                 {
-                    continue;
+                    await FlushWithRetryAsync(batch, stoppingToken);
                 }
-                // FIX: Pass stoppingToken, but does not cts.Token!
-                var written = await _repository.InsertBatchAsync(batch, stoppingToken);
-                _logger.LogDebug("Flushed {Count} log entries to DB", written);
-                // ✅ ОЧИЩАЕМ ЗДЕСЬ! 
-                // Если запись прошла успешно, список нам больше не нужен.
-                // Если же выключение произойдет после этой строки, в DrainRemainingAsync уйдет пустой список.
-                batch.Clear();
             }
-            catch (OperationCanceledException) { break; }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Batch write failed, entries will be lost");
-                batch.Clear();
-            }
-          /*  finally
-            {
-                // TODO:  Реализуйте политику повторных попыток (Retry Policy)
-                // или механизм Dead Letter Queue.    
-                batch.Clear();
-            }*/
+        }
+        catch (OperationCanceledException) when(stoppingToken.IsCancellationRequested)
+        {
+            // Graceful shutdown. Недописанный batch остаётся в списке —
+            // его дольёт DrainRemainingAsync вместе с остатками канала.
+        }
+        finally
+        {
+            _lingerCts.Dispose();
         }
 
         // Дописываем хвостик из batch плюс то что осталось в channel
-        await DrainRemainingAsync(batch, stoppingToken);
+        // stoppingToken уже отменён на этот момент
+        await DrainRemainingAsync(batch);
     }
 
-    private async Task DrainRemainingAsync(List<LogEntry> batch, CancellationToken stoppingToken)
-    {
-        while (_channel.Reader.TryRead(out var entry))
-        {
-            batch.Add(entry);
-        }
-
-        if (batch.Count > 0)
-        {
-            // CancellationToken.None — намеренно: stoppingToken уже отменён,
-            // но финальный flush мы обязаны довести до конца.
-            await _repository.InsertBatchAsync(batch, CancellationToken.None);
-            _logger.LogInformation("Final flush: {Count} entries", batch.Count);
-        }
-    }
-
-    private async Task FillBatchAsync(List<LogEntry> batch, CancellationToken stoppingToken)
+    private async Task FlushWithRetryAsync(List<LogEntry> batch, CancellationToken ct)
     {
         try
         {
-            // 1. Initial wait: Don't start a batch until there is at least one item.
-            var firstEntry = await _channel.Reader.ReadAsync(stoppingToken);
-            batch.Add(firstEntry);
+            // Polly будет тут, пока в репозиторий
+            await _repository.InsertBatchAsync(batch, ct);
 
-            // 2. Fill the rest of the batch greedily
-            while (batch.Count < _logOptions.BatchSize)
-            {
-                // Try to pull items that are already sitting in the buffer
-                if (_channel.Reader.TryRead(out var entry))
-                {
-                    batch.Add(entry);
-                }
-                else
-                {
-                    // Buffer is empty. Wait for more, or exit if the Channel is closed.
-                    if (false == await _channel.Reader.WaitToReadAsync(stoppingToken))
-                    {
-                        // Channel was marked as Complete and is empty
-                        break;
-                    }
-                }
-            }
+            batch.Clear();
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Shutdown посреди записи — это НЕ повод хоронить батч в DLQ.
+            // Пробрасываем наверх, batch не очищаем: DrainRemainingAsync
+            // сделает финальную попытку со свежим токеном.
+            throw;
+        }
+        catch (Exception ex)
+        {
+           // Сделаем Logging
+           // И DLQ
+
+
+            batch.Clear();
+        }
+    }
+
+    private async Task DrainRemainingAsync(List<LogEntry> batch)
+    {
+        // Синхронно выгребаем всё, что осталось в канале (писатели уже остановлены хостом).
+        while (_channel.Reader.TryRead(out var entry))
+            batch.Add(entry);
+
+        if (batch.Count == 0)
+        {
+            return;
+        }
+
+        // НЕ линкуемся на stoppingToken — он уже отменён, и linked-токен
+        // родился бы «мёртвым»: InsertBatchAsync отменился бы мгновенно,
+        // а финальные логи терялись бы при каждом рестарте сервиса.
+        // Независимый дедлайн; должен укладываться в HostOptions.ShutdownTimeout.
+        using var cts = new CancellationTokenSource(_logOptions.ShutdownFlushTimeout);
+
+        try
+        {
+            await _repository.InsertBatchAsync(batch, cts.Token);
+            // logging тут
         }
         catch (OperationCanceledException)
         {
-            // Normal shutdown behavior; the batch gathered so far is still in the 'batch' list
+            // Сделаем Logging
+            // И DLQ 
         }
-        catch(ChannelClosedException)
+        catch (Exception ex)
         {
-            // Channel was closed while we were reading
+
+            // Сделаем Logging
+            // И DLQ;
         }
+        finally
+        {
+            batch.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Собираем батч: блокируется до первого элемента, затем добираем до BatchSize
+    /// либо до истечения linger-окна (FlushInterval), отсчитываемого от первого элемента.
+    /// </summary>
+    /// <param name="batch"></param>
+    /// <param name="stoppingToken"></param>
+    /// <returns>false - каналл закрыт, продолжать цикл бессмысленно</returns>
+    private async Task<bool> FillBatchAsync(List<LogEntry> batch, CancellationToken stoppingToken)
+    {
+        LogEntry? entry;
+
+        try
+        {
+            // Ждём первый элемент без таймаута: пустой канал не должен
+            //будить сервис вхолостую каждые FlushInterval.
+            entry = await _channel.Reader.ReadAsync(stoppingToken);
+        }
+        catch (ChannelClosedException)
+        {
+            return false;
+        }
+
+        batch.Add(entry);
+
+        // Монотонный дедлайн вместо CancelAfter-на-итерацию:
+        // TickCount64 не зависит от перевода системных часов и ничего не аллоцирует.
+        var deadline = Environment.TickCount64 + (long)_logOptions.FlushInterval.TotalMilliseconds;
+
+        while (batch.Count < _logOptions.BatchSize)
+        {
+            // Горячий путь: элементы уже в канале - забираем синхронно, без await
+            if (_channel.Reader.TryRead(out entry))
+            {
+                batch.Add(entry);
+                continue;
+            }
+
+            var remaining = deadline - Environment.TickCount64;
+            if (remaining <= 0)
+            {
+                break; // linger истёк - отдаём неполный батч
+            }
+
+            // Переиспользуем CTS. TryReset() возвращает true, если предыдущий
+            // CancelAfter не успел сработать (мы вышли из ожидания по данным) —
+            // тогда таймер просто перевзводится без аллокаций.
+            // false — таймер сработал или прилетел stoppingToken: пересоздаём.
+            if (false == _lingerCts.TryReset())
+            {
+                _lingerCts.Dispose();
+                _lingerCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            }
+            _lingerCts.CancelAfter(TimeSpan.FromMilliseconds(remaining));
+
+            try
+            {
+                // ВАЖНО: false означает «канал completed и пуст».
+                // Ранее это не проверялось -> бесконечный spin на 100% CPU.
+                if (false == await _channel.Reader.WaitToReadAsync(_lingerCts.Token))
+                {
+                    return false;
+                }
+            }
+            catch(OperationCanceledException) when (false==stoppingToken.IsCancellationRequested)
+            {
+                break; // сработал имеено linger-таймер
+            }
+            // OCE от stoppingToken пробрасывается в ExecuteAsync:
+            // там его перехватит фильтрованный catch, batch уцелеет.
+            catch (ChannelClosedException)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 }

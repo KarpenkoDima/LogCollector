@@ -18,19 +18,20 @@ public class BatchWriteServiceTests
    
     public BatchWriteServiceTests()
     {
-        _channel = new LogChannel();
+       
         _repositoryMock = new Mock<ILogRepository>();
 
-        _testOptions = new LogCollectorOptions
+       _testOptions = new LogCollectorOptions
         {
             BatchSize=3,
-            FlushInterval=1,
+            FlushInterval=TimeSpan.FromSeconds(1),
         };
+        _channel = new LogChannel(Options.Create(_testOptions));
     }
         
     private BatchWriteService CreateService(int timeoutInSeconds = 1)
     {
-        _testOptions.FlushInterval = timeoutInSeconds;
+        _testOptions.FlushInterval = TimeSpan.FromSeconds(timeoutInSeconds);
         var optionsMock = Options.Create(_testOptions);
 
         return new BatchWriteService(
@@ -112,15 +113,17 @@ public class BatchWriteServiceTests
         _repositoryMock.SetupSequence(r => r.InsertBatchAsync(
             It.IsAny<IReadOnlyList<LogEntry>>(),
             It.IsAny<CancellationToken>()))
-            .Returns(async () =>
+            .Returns(() =>
             {
                 firstCallTcs.TrySetResult();
-                throw new Exception("Database is down");
-                return 0;
-            }).Returns(async () =>
+                // вернем Task с ошибкой вместо throw
+               return  Task.FromException<int>( new Exception("Database is down"));
+                
+            }).Returns(() =>
             {
                 secondCallTcs.TrySetResult();              
-                return 3;
+                // Возвращаем успешный Task
+                return Task.FromResult(3);
             });
 
 

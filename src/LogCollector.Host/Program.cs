@@ -49,7 +49,7 @@ builder.Services.AddKeyedSingleton<ILogParser, SyslogParser>("mikrotik");
 // ------------------------------------------------------------------------------
 // 1. Get connection string or fallback
 var connectionString = builder.Configuration["Database:ConnectionString"]
-    ?? "Data Source=log.db";
+    ?? "Data Source=logs_2.db";
 
 // 2. Safely parse the connection string to extract the file name/path
 var connectionBuilder = new SqliteConnectionStringBuilder(connectionString);

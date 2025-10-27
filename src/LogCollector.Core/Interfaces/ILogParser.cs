@@ -5,5 +5,5 @@ namespace LogCollector.Core.Interfaces;
 
 public interface ILogParser
 {
-    LogEntry? TryParse(ReadOnlyMemory<byte> data, IPEndPoint remoteEndpoint);
+    bool TryParse(ReadOnlyMemory<byte> data, IPEndPoint remoteEndpoint, out LogEntry logEntry);
 }

@@ -1,0 +1,78 @@
+# /etc/systemd/system/logcollector.service
+#
+# Installation:
+#   sudo cp logcollector.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now logcollector
+#
+# Logs:
+#   journalctl -u logcollector -f
+#
+# Status:
+#   systemctl status logcollector
+
+[Unit]
+Description=LogCollector — Syslog ingestion from MikroTik and Windows machines
+# Start only after the network stack is available.
+# "network-online.target" would wait for an IP address; "network.target"
+# is sufficient since we're binding a server socket (not making outbound connections).
+After=network.target
+# Restart if the SQLite directory is a separate mount (NFS, external drive)
+# by adding: After=var-log-logcollector.mount
+
+[Service]
+Type=notify
+# "notify" means systemd waits for sd_notify("READY=1") before declaring the
+# service started.  AddSystemd() in Program.cs sends this signal automatically
+# once all IHostedService.StartAsync calls complete — i.e., once the UDP socket
+# is bound and the SQLite schema is verified.  Without this, systemd would report
+# the service as "active" before the listener is actually ready.
+
+ExecStart=/opt/logcollector/LogCollector.Host
+WorkingDirectory=/opt/logcollector
+
+# Run under a dedicated, unprivileged system account.
+# Create it once with: sudo useradd -r -s /sbin/nologin logcollector
+User=logcollector
+Group=logcollector
+
+# Give the binary the ability to bind port 514 without running as root.
+# This is the recommended alternative to "User=root".
+# It grants only the specific capability needed, nothing else.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# If you prefer NOT to use capabilities, comment out the two lines above
+# and instead redirect port 514 at the firewall level (set Port=5140 in config):
+#   sudo iptables -t nat -A PREROUTING -p udp --dport 514 -j REDIRECT --to-port 5140
+#   sudo ip6tables -t nat -A PREROUTING -p udp --dport 514 -j REDIRECT --to-port 5140
+
+# ── Reliability ───────────────────────────────────────────────────────────────
+Restart=on-failure
+RestartSec=5
+# Allow up to 3 restarts in 60 seconds before systemd gives up.
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Give the service up to 10 seconds to drain the channel on SIGTERM.
+# After this, systemd sends SIGKILL.  The BatchWriterService drain phase
+# typically completes in < 1 second unless SQLite is under heavy I/O pressure.
+TimeoutStopSec=10
+
+# ── Environment ───────────────────────────────────────────────────────────────
+Environment=DOTNET_ENVIRONMENT=Production
+
+# Example: override the SQLite path without editing appsettings.json.
+# Environment=BATCHWRITER__CONNECTIONSTRING=Data Source=/mnt/nas/logs.db
+
+# ── Security hardening ────────────────────────────────────────────────────────
+NoNewPrivileges=yes
+PrivateTmp=yes
+# Protect the system filesystem from writes; explicitly allow only the log dir.
+ProtectSystem=strict
+ReadWritePaths=/var/log/logcollector
+# Prevent the service from writing to /home directories.
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

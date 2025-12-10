@@ -29,3 +29,5 @@ loki-config.yaml
 grafana-datasources.yaml
 grafana-dashboard.json
 grafana-dashboard-provider.yaml
+log-new.txt
+setup-git-history-existing.sh

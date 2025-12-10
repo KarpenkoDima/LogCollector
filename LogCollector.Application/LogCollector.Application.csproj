@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!--
+      Application defines use-case interfaces (ILogRepository, etc.).
+      It knows about Core domain types but knows nothing about how they are
+      persisted, transported, or serialised — those are Infrastructure concerns.
+    -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LogCollector.Core\LogCollector.Core.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -77,7 +77,7 @@ services:
     profiles: ["sqlite"]
     restart: unless-stopped
     ports:
-      - "514:5140/udp"
+      - "5140:5140/udp"
     volumes:
       - logcollector-data:/var/log/logcollector
     environment:
@@ -142,7 +142,7 @@ services:
     profiles: ["monitoring"]
     restart: unless-stopped
     ports:
-      - "514:5140/udp"
+      - "5140:5140/udp"
     volumes:
       - logcollector-data:/var/log/logcollector
     environment:

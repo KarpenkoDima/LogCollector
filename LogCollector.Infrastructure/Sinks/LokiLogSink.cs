@@ -22,7 +22,7 @@ namespace LogCollector.Infrastructure.Sinks;
 /// strings for a 10_000-entry batch). These strings survive into Gen2. The manual partition
 /// allocates one string per distinct hostname - typical 1-5 routers in production.
 /// </summary>
-public sealed class LokiLogSink : ILogSink
+public sealed class LokiLogSink : ILogSink, IDisposable
 {    
     private readonly Dictionary<string, string> _labels;
     private readonly HttpClient _http;
@@ -60,7 +60,7 @@ public sealed class LokiLogSink : ILogSink
 
     public async Task SaveBatchAsync(IReadOnlyList<LogEntry> batch, CancellationToken ct)
     {
-        if (batch != null && batch.Count > 0) return;
+        if (batch == null || batch.Count == 0) return;
 
         // --- Step 1: Manual partition by hostname ---
         // Avoids LINQ GroupBy's Lookup<TKey, TElement> allocations.
@@ -102,6 +102,12 @@ public sealed class LokiLogSink : ILogSink
                 var msg = Encoding.UTF8.GetString(entry.Message.Span);
                 values[v] = new[] { tsNs, msg};
             }
+            
+            streams.Add(new
+            {
+                stream=streamLabels,
+                values
+            });
         }
 
         // --- Step 3: Push ---
@@ -118,5 +124,10 @@ public sealed class LokiLogSink : ILogSink
             _logger.LogError(ex, "[Loki] Failed to push {Count} entries", batch.Count);
             throw;
         }
+    }
+
+    public void Dispose()
+    {
+        _http.Dispose();
     }
 }

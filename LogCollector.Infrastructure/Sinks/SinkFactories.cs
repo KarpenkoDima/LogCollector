@@ -42,9 +42,11 @@ public sealed class LokiSinkFactory : ISinkFactory
         var labels = config.GetSection("Labels")
             .GetChildren()
             .ToDictionary(c => c.Key, c => c.Value ?? string.Empty);
+        
+        var http = new HttpClient{BaseAddress = new System.Uri(endpoint)};
 
         return new LokiLogSink(
-            endpoint,
+            http,
             labels,
             services.GetRequiredService<ILogger<LokiLogSink>>());
     }

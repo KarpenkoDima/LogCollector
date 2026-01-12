@@ -21,7 +21,7 @@ namespace LogCollector.Infrastructure.Sinks;
 /// implement its own retry logic internally if needed.
 /// </para>
 /// </summary>
-public sealed class FanOutLogRepository : ILogRepository
+public sealed class FanOutLogRepository : ILogRepository, IDisposable
 {
     private readonly ILogSink[] _sinks;
 
@@ -45,4 +45,15 @@ public sealed class FanOutLogRepository : ILogRepository
     /// </summary>
     public Task SaveBatchAsync(IReadOnlyList<LogEntry> batch, CancellationToken ct)
         => Task.WhenAll(_sinks.Select(s => s.SaveBatchAsync(batch, ct)));
+
+    public void Dispose()
+    {
+        foreach (var sink in _sinks)
+        {
+            if (sink is IDisposable disposable)
+            {
+                disposable.Dispose();
+            }
+        }
+    }
 }

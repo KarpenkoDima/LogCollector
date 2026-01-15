@@ -41,7 +41,7 @@ public sealed class SqliteLogSink : ILogSink
                 Topic        TEXT    NOT NULL,
                 Severity     INTEGER NOT NULL,
                 Message      TEXT    NOT NULL,
-                ReceivedAt   TEXT    NOT NULL
+                ReceivedAt   INTEGER NOT NULL -- Unix milliseconds (UTC)
             );
             CREATE INDEX IF NOT EXISTS idx_logs_received_at ON Logs(ReceivedAt);
             CREATE INDEX IF NOT EXISTS idx_logs_hostname    ON Logs(Hostname);
@@ -72,7 +72,7 @@ public sealed class SqliteLogSink : ILogSink
         var pTopic = cmd.Parameters.Add("@topic", SqliteType.Text);
         var pSev   = cmd.Parameters.Add("@sev",   SqliteType.Integer);
         var pMsg   = cmd.Parameters.Add("@msg",   SqliteType.Text);
-        var pRecv  = cmd.Parameters.Add("@recv",  SqliteType.Text);
+        var pRecv  = cmd.Parameters.Add("@recv",  SqliteType.Integer);
 
         cmd.Prepare();
 
@@ -84,7 +84,7 @@ public sealed class SqliteLogSink : ILogSink
             pTopic.Value = Encoding.UTF8.GetString(entry.Topic.Span);
             pSev.Value   = (int)entry.Severity;
             pMsg.Value   = Encoding.UTF8.GetString(entry.Message.Span);
-            pRecv.Value  = entry.ReceivedAt.ToString("o", CultureInfo.InvariantCulture);
+            pRecv.Value  = entry.ReceivedAt.ToUnixTimeMilliseconds(); 
 
             await cmd.ExecuteNonQueryAsync(ct);
         }

@@ -3,8 +3,8 @@ using System.Text;
 using System.Threading.Channels;
 using LogCollector.Application.Interfaces;
 using LogCollector.Core.Domain;
-using LogCollector.Infrastructure.Persistence;
 using LogCollector.Infrastructure.Pipeline;
+using LogCollector.Infrastructure.Sinks;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -18,11 +18,12 @@ namespace LogCollector.Tests.Pipeline;
 /// Two tiers of tests live here:
 ///
 /// Tier 1 — Pure unit tests using <see cref="InMemoryLogRepository"/>.
-/// Run in milliseconds with no I/O. BatchWriterService is now fully testable
-/// in isolation because it depends on ILogRepository, not on SqliteConnection.
+/// Run in milliseconds with no I/O. BatchWriterService is fully testable
+/// in isolation because it depends on ILogRepository, not SqliteConnection.
 ///
-/// Tier 2 — Integration tests using <see cref="SqliteLogRepository"/>.
-/// Verify the byte→string→SQLite TEXT round-trip against a real (in-memory) database.
+/// Tier 2 — Integration tests using SqliteLogSink via FanOutLogRepository.
+/// SqliteLogRepository was removed — SqliteLogSink is the sole owner of
+/// the schema and the write path.
 /// </summary>
 public sealed class BatchWriterServiceTests : IAsyncLifetime
 {
@@ -32,6 +33,7 @@ public sealed class BatchWriterServiceTests : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
+        // Guardian connection keeps the in-memory DB alive for the test duration.
         _guardian = new SqliteConnection(SqliteCs);
         await _guardian.OpenAsync();
     }
@@ -139,7 +141,7 @@ public sealed class BatchWriterServiceTests : IAsyncLifetime
     // ── Tier 2: integration tests against real SQLite ─────────────────────────
 
     [Fact]
-    public async Task SqliteRepository_StoresAndRetrievesAllFields_Correctly()
+    public async Task SqliteSink_StoresAndRetrievesAllFields_Correctly()
     {
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         var repo      = BuildSqliteRepo();
@@ -167,7 +169,7 @@ public sealed class BatchWriterServiceTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task SqliteRepository_MultipleHosts_NoFieldCrossContamination()
+    public async Task SqliteSink_MultipleHosts_NoFieldCrossContamination()
     {
         var hosts     = new[] { "mtk-router", "win-server-01", "switch-core" };
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -189,9 +191,17 @@ public sealed class BatchWriterServiceTests : IAsyncLifetime
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private SqliteLogRepository BuildSqliteRepo() =>
-        new(Options.Create(new SqliteOptions { ConnectionString = SqliteCs }),
-            NullLogger<SqliteLogRepository>.Instance);
+    /// <summary>
+    /// Creates SqliteLogSink and wraps it in FanOutLogRepository.
+    /// SqliteLogRepository was removed — SqliteLogSink is the canonical
+    /// write path. FanOutLogRepository.InitializeAsync propagates to
+    /// SqliteLogSink.InitializeAsync which creates the schema.
+    /// </summary>
+    private ILogRepository BuildSqliteRepo()
+    {
+        var sink = new SqliteLogSink(SqliteCs, NullLogger<SqliteLogSink>.Instance);
+        return new FanOutLogRepository(new ILogSink[] { sink });
+    }
 
     private (Channel<LogEntry>, BatchWriterService) BuildService(
         ILogRepository repository, int batchSize = 500, TimeSpan? batchTimeout = null)

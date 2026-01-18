@@ -168,23 +168,39 @@ public sealed class SyslogParserTests
         Assert.False(ok);
     }
 
-    [Fact]
-    public void TryParse_MissingMikroTikSeparator_ReturnsFalse()
-    {
-        // Standard RFC 3164 lines use "HOSTNAME TOPIC[PID]: MESSAGE" with no " : ".
-        // We only support the MikroTik extension — other formats return false.
-        bool ok = ParseString("<30>Jun  4 18:00:00 fw system info msg", out _);
-        Assert.False(ok);
-    }
+   [Fact]
+public void TryParse_RFC3164WithoutSeparator_IsAcceptedAsFormatB()
+{
+    // After dual-format support was added the parser accepts RFC 3164 lines
+    // that have no " : " MikroTik separator (bsd-syslog=yes on the router).
+    // Severity falls back to PriToSeverity(PRI & 7).
+    // Real-world example: MikroTikHome sends exactly this format.
+    bool ok = ParseString("<30>Jun  4 18:00:00 fw system info msg", out var entry);
 
-    [Fact]
-    public void TryParse_MissingCommaInTopicSeverity_ReturnsFalse()
-    {
-        // After the MikroTik separator we expect "TOPIC,SEVERITY".
-        // If there is no comma, we cannot extract the topic.
-        bool ok = ParseString("<30>Jun  4 18:00:00 fw : system-info msg", out _);
-        Assert.False(ok);
-    }
+    Assert.True(ok);
+    Assert.Equal("fw",              ToUtf8(entry.Hostname));
+    Assert.Equal(SyslogSeverity.Info, entry.Severity); // 30 & 7 = 6 → Info
+    Assert.True(entry.Topic.IsEmpty);
+    Assert.Equal("system info msg", ToUtf8(entry.Message));
+}
+
+
+    // Стало:
+[Fact]
+public void TryParse_MikroTikTagWithoutComma_AcceptedWithEmptyTopic()
+{
+    // MikroTik separator " : " is present but tag has no comma.
+    // Parser cannot extract topic or text severity — falls back to PriToSeverity.
+    // Entry is NOT dropped: preserving an imperfect record beats silent data loss.
+    bool ok = ParseString("<30>Jun  4 18:00:00 fw : system-info msg", out var entry);
+
+    Assert.True(ok);
+    Assert.Equal("fw",                SyslogSeverity.Info == entry.Severity
+        ? "fw" : ToUtf8(entry.Hostname));
+    Assert.True(entry.Topic.IsEmpty);
+    Assert.Equal("system-info msg",   ToUtf8(entry.Message));
+    Assert.Equal(SyslogSeverity.Info, entry.Severity); // 30 & 7 = 6 → Info
+}
 
     // ── Zero-copy architectural proof ─────────────────────────────────────────
 

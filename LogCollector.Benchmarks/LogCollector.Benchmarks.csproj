@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <!-- BenchmarkDotNet requires Release to produce trustworthy numbers. -->
+    <Configurations>Debug;Release</Configurations>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" Version="0.14.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Benchmarks reference Core directly so they measure allocation behaviour
+      against the real LogEntry struct that travels through the pipeline —
+      not a local stand-in that can drift from production.
+    -->
+    <ProjectReference Include="..\LogCollector.Core\LogCollector.Core.csproj" />
+  </ItemGroup>
+
+</Project>

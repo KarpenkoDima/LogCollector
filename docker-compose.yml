@@ -188,7 +188,7 @@ services:
       LOGSINKS__0__CONNECTIONSTRING: "Data Source=/var/log/logcollector/logs.db"
       LOGSINKS__1__TYPE: "Loki"
       LOGSINKS__1__ENDPOINT: "http://loki:3100"
-      LOGSINKS__1__LABELS__APP: "logcollector"
+      LOGSINKS__1__LABELS__app: "logcollector"
     networks:
       - logcollector-net
     depends_on:

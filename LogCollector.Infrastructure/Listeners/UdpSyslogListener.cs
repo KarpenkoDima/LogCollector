@@ -48,7 +48,8 @@ public sealed class UdpSyslogListener : BackgroundService
         using var socket = CreateBoundSocket(_options.Port);
 
         Memory<byte> receiveWindow = _pinnedReceiveBuffer;
-        EndPoint sender = new IPEndPoint(IPAddress.Any, 0);
+
+        SocketAddress senderAddress = new SocketAddress(AddressFamily.InterNetwork);
 
         _logger.LogInformation(
             "UDP listener bound to 0.0.0.0:{Port} (max datagram: {Max} bytes)",
@@ -56,11 +57,11 @@ public sealed class UdpSyslogListener : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            SocketReceiveFromResult received;
+            int length;
             try
             {
-                received = await socket
-                    .ReceiveFromAsync(receiveWindow, SocketFlags.None, sender, stoppingToken)
+                length = await socket
+                    .ReceiveFromAsync(receiveWindow, SocketFlags.None, senderAddress, stoppingToken)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -73,25 +74,20 @@ public sealed class UdpSyslogListener : BackgroundService
                     "Socket error (SocketError={Code}); continuing", ex.SocketErrorCode);
                 continue;
             }
-
-            int length = received.ReceivedBytes;
-
+                        
             IMemoryOwner<byte>? datagramOwner = MemoryPool<byte>.Shared.Rent(length);
             bool ownershipTransferred = false;
 
             try
             {
                 _pinnedReceiveBuffer.AsSpan(0, length).CopyTo(datagramOwner.Memory.Span);
-
                 ReadOnlyMemory<byte> datagram = datagramOwner.Memory[..length];
 
-                // _parser is a CompositeLogParser — it tries each registered format in order.
-                // No format-specific code lives here.
                 if (!_parser.TryParse(datagram, DateTimeOffset.UtcNow, out var entry))
                 {
-                    _logger.LogDebug(
-                        "No parser matched datagram ({Length} B) from {Sender}",
-                        length, received.RemoteEndPoint);
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug(
+                            "No parser matched datagram ({Length} B)", length);
                     continue;
                 }
 
@@ -108,7 +104,6 @@ public sealed class UdpSyslogListener : BackgroundService
 
         _logger.LogInformation("UDP listener stopped");
     }
-
     private static Socket CreateBoundSocket(int port)
     {
         var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);

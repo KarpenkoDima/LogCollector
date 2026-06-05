@@ -8,23 +8,33 @@ using Microsoft.Extensions.Options;
 namespace LogCollector.Infrastructure.Pipeline;
 
 /// <summary>
-/// A <see cref="BackgroundService"/> that drains <see cref="LogEntry"/> values from the
-/// bounded channel and delegates persistence to <see cref="ILogRepository"/>.
+/// A <see cref="BackgroundService"/> that accumulates <see cref="LogEntry"/> values
+/// from the bounded channel into batches and delegates persistence to
+/// <see cref="ILogRepository"/>.
 ///
 /// <para>
 /// This class knows nothing about SQLite, connection strings, or SQL syntax.
-/// Those details live in <c>SqliteLogRepository</c> (Infrastructure.Persistence).
 /// Injecting a different <see cref="ILogRepository"/> — for example, an in-memory
 /// fake — is sufficient to unit-test all timing and disposal behaviour here
-/// without touching a database at all.
+/// without touching a database.
 /// </para>
 ///
-/// <para><b>Batch-drain pattern (Cleary):</b></para>
+/// <para><b>Windowed accumulation (P0.2 fix):</b></para>
 /// <para>
-/// <c>WaitToReadAsync</c> parks the thread until data arrives or the timeout fires.
-/// <c>TryRead</c> in a tight loop then drains up to <c>BatchSize</c> entries
-/// synchronously — no round-trips to the scheduler, no per-entry awaits.
-/// One <c>SaveBatchAsync</c> call (= one SQLite transaction) covers the whole batch.
+/// A batch is a WINDOW that opens on the first entry and closes on the FIRST of:
+/// </para>
+/// <list type="bullet">
+///   <item>batch reaches <c>BatchSize</c> — flush immediately;</item>
+///   <item><c>BatchTimeout</c> elapses since the first entry — flush partial;</item>
+///   <item>the channel completes (producer done) — flush remainder, exit;</item>
+///   <item>shutdown is requested — break to the final drain.</item>
+/// </list>
+/// <para>
+/// The earlier implementation drained only the channel SNAPSHOT at wake-up
+/// time. On real (non-burst) traffic that produced batches of size 1
+/// (one entry arrives, wake, drain-one, flush, repeat). Windowed accumulation
+/// waits for more entries within the timeout, so 20 entries at BatchSize=8
+/// produce batches of [8, 8, 4] instead of twenty batches of [1].
 /// </para>
 /// </summary>
 public sealed class BatchWriterService : BackgroundService
@@ -48,47 +58,82 @@ public sealed class BatchWriterService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // Delegate schema creation to the repository — BatchWriterService
-        // has no business knowing whether the store is SQLite, Postgres, or a file.
         await _repository.InitializeAsync(stoppingToken);
 
         var batch = new List<LogEntry>(_options.BatchSize);
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            // ── Wait for data (with timeout) ──────────────────────────────────
-            using var batchCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-            batchCts.CancelAfter(_options.BatchTimeout);
-
-            bool channelCompleted = false;
+            // ── 1. Wait for the FIRST entry of a new window ───────────────────
+            // Only shutdown interrupts this wait — no timeout yet, because the
+            // window (and its timer) starts when the first entry actually arrives.
+            bool hasData;
             try
             {
-                bool hasMore = await _reader.WaitToReadAsync(batchCts.Token);
-                if (!hasMore) channelCompleted = true;
+                hasData = await _reader.WaitToReadAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 break;
             }
+
+            if (!hasData)
+                break;   // channel completed (producer done) — go to final drain
+
+            // ── 2. Open the window: timer starts NOW, on the first entry ──────
+            // Linked to stoppingToken so shutdown also cancels the window wait.
+            using var windowCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            windowCts.CancelAfter(_options.BatchTimeout);
+
+            bool channelCompleted = false;
+
+            // ── 3. Accumulate until BatchSize OR timeout OR completion ────────
+            try
+            {
+                while (batch.Count < _options.BatchSize)
+                {
+                    // Drain everything available right now, synchronously.
+                    while (batch.Count < _options.BatchSize && _reader.TryRead(out var entry))
+                        batch.Add(entry);
+
+                    if (batch.Count >= _options.BatchSize)
+                        break;   // window closed by size
+
+                    // Not full yet — wait for the next entry WITHIN the window.
+                    // windowCts fires either on BatchTimeout or on shutdown.
+                    if (!await _reader.WaitToReadAsync(windowCts.Token))
+                    {
+                        channelCompleted = true;   // producer completed mid-window
+                        break;
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                // Shutdown during the window — flush what we have, then break.
+                if (batch.Count > 0)
+                    await SaveAndDisposeAsync(batch, CancellationToken.None);
+                batch.Clear();
+                break;
+            }
             catch (OperationCanceledException)
             {
-                // BatchTimeout — fall through to flush partial batch.
+                // BatchTimeout elapsed — window closed by time. Flush partial.
+                // (windowCts fired but stoppingToken did NOT — normal timeout.)
             }
 
-            // ── Drain synchronously ───────────────────────────────────────────
-            while (batch.Count < _options.BatchSize && _reader.TryRead(out var entry))
-                batch.Add(entry);
-
+            // ── 4. Flush the window (closed by size, timeout, or completion) ──
             if (batch.Count > 0)
             {
                 await SaveAndDisposeAsync(batch, stoppingToken);
                 batch.Clear();
             }
 
-            if (channelCompleted) break;
+            if (channelCompleted)
+                break;
         }
 
-        // ── Drain remaining entries on shutdown ───────────────────────────────
+        // ── 5. Final drain on shutdown ────────────────────────────────────────
         _logger.LogInformation("BatchWriterService stopping — draining channel");
 
         while (_reader.TryRead(out var entry))
@@ -131,7 +176,6 @@ public sealed class BatchWriterService : BackgroundService
         }
         finally
         {
-            // Return every pool buffer to ArrayPool regardless of write outcome.
             foreach (var entry in batch)
                 entry.RawBuffer?.Dispose();
         }

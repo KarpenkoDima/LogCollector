@@ -176,6 +176,105 @@ public sealed class ProductionReadinessTests
         Assert.Equal(new[] { 8, 8, 4 }, repo.BatchSizes.ToArray());
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // P0.3 — Graceful shutdown: хвост сохранён, все owners освобождены ровно раз
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    // Критерии аудита: listener остановлен первым, ingress завершён, writer
+    // сохраняет хвост, после StopAsync outstanding owners == 0.
+    // Тесты доказывают критерии 3 и 4 (writer сохраняет хвост + owners=0).
+
+    [Fact]
+    public async Task Shutdown_WithGatedRepository_SavesTail_AndDisposesEveryOwnerOnce()
+    {
+        // Gate-подход: repository блокируется на первом вызове, пока мы не
+        // отпустим gate. Это ДЕТЕРМИНИРОВАННО гарантирует, что на момент
+        // StopAsync в канале висит необработанный хвост.
+        var channel = Channel.CreateBounded<LogEntry>(1_000);
+        var gate    = new SemaphoreSlim(0, 1);
+        var repo    = new GatedRepository(gate);
+        var opts    = Options.Create(new BatchWriterOptions
+        {
+            BatchSize    = 4,
+            BatchTimeout = TimeSpan.FromMilliseconds(50),
+        });
+        var svc = new BatchWriterService(
+            channel.Reader, repo, opts, NullLogger<BatchWriterService>.Instance);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await svc.StartAsync(cts.Token);
+
+        // Пишем 10 записей с отслеживаемыми owner'ами.
+        var owners = new List<TrackingOwner>();
+        for (int i = 0; i < 10; i++)
+        {
+            var owner = new TrackingOwner();
+            owners.Add(owner);
+            await channel.Writer.WriteAsync(EntryWith(owner), cts.Token);
+        }
+
+        // Даём consumer'у войти в первый SaveBatchAsync и застрять на gate.
+        await Task.Delay(200, cts.Token);
+
+        // Отпускаем gate — consumer сможет обрабатывать. Одновременно
+        // инициируем shutdown: часть записей — хвост — ещё в канале.
+        gate.Release();
+        await svc.StopAsync(cts.Token);
+
+        // Assert 3 (критерий): ВСЕ 10 записей дошли до repo — хвост не потерян.
+        Assert.Equal(10, repo.TotalSaved);
+
+        // Assert 4 (критерий): каждый owner освобождён РОВНО ОДИН РАЗ.
+        // Ноль → потерян буфер (leak). Два → double-dispose (баг).
+        foreach (var owner in owners)
+            Assert.Equal(1, owner.DisposeCount);
+
+        // Outstanding owners == 0: сумма недиспозженных.
+        Assert.Equal(0, owners.Count(o => o.DisposeCount == 0));
+    }
+
+    [Fact]
+    public async Task Shutdown_UnderLoad_LosesNothing_AndDisposesEveryOwnerOnce()
+    {
+        // Нагрузочный подход: непрерывно пишем, пока consumer обрабатывает,
+        // затем резко останавливаем. Реалистичнее gate — проверяет, что при
+        // живом потоке shutdown не роняет ни одной записи.
+        var channel = Channel.CreateBounded<LogEntry>(10_000);
+        var repo    = new CountingRepository();
+        var opts    = Options.Create(new BatchWriterOptions
+        {
+            BatchSize    = 16,
+            BatchTimeout = TimeSpan.FromMilliseconds(20),
+        });
+        var svc = new BatchWriterService(
+            channel.Reader, repo, opts, NullLogger<BatchWriterService>.Instance);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        await svc.StartAsync(cts.Token);
+
+        // Пишем 500 записей потоком с отслеживанием owner'ов.
+        const int total = 500;
+        var owners = new List<TrackingOwner>(total);
+        for (int i = 0; i < total; i++)
+        {
+            var owner = new TrackingOwner();
+            owners.Add(owner);
+            await channel.Writer.WriteAsync(EntryWith(owner), cts.Token);
+            if (i % 50 == 0)
+                await Task.Delay(1, cts.Token);   // лёгкие зазоры, имитация трафика
+        }
+
+        // Останавливаем — финальный drain должен сохранить весь хвост.
+        await svc.StopAsync(cts.Token);
+
+        // Ничего не потеряно: все 500 записей сохранены.
+        var totalSaved = repo.BatchSizes.Sum();
+        Assert.Equal(total, totalSaved);
+
+        // Каждый owner освобождён ровно один раз — ни leak, ни double-dispose.
+        Assert.Equal(0, owners.Count(o => o.DisposeCount != 1));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static LogEntry EntryWith(IMemoryOwner<byte> owner) =>
@@ -229,10 +328,46 @@ public sealed class ProductionReadinessTests
         }
     }
 
+    /// <summary>
+    /// Repository, который блокируется на первом SaveBatchAsync до release gate.
+    /// Гарантирует детерминированное наличие необработанного хвоста на StopAsync.
+    /// </summary>
+    private sealed class GatedRepository : ILogRepository
+    {
+        private readonly SemaphoreSlim _gate;
+        private readonly object _lock = new();
+        private bool _gatePassed;
+        private int _totalSaved;
+
+        public GatedRepository(SemaphoreSlim gate) => _gate = gate;
+
+        public int TotalSaved { get { lock (_lock) return _totalSaved; } }
+
+        public Task InitializeAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public async Task SaveBatchAsync(IReadOnlyList<LogEntry> batch, CancellationToken ct)
+        {
+            // Первый вызов ждёт gate — держит consumer, пока копится хвост.
+            // CancellationToken.None в финальном drain: gate уже отпущен к тому
+            // моменту, так что блокировки при shutdown не будет.
+            bool needGate;
+            lock (_lock) { needGate = !_gatePassed; _gatePassed = true; }
+            if (needGate)
+                await _gate.WaitAsync(CancellationToken.None);
+
+            lock (_lock) _totalSaved += batch.Count;
+        }
+    }
+
     private sealed class TrackingOwner : IMemoryOwner<byte>
     {
-        public bool IsDisposed { get; private set; }
+        private int _disposeCount;
+        public int DisposeCount => Volatile.Read(ref _disposeCount);
+        public bool IsDisposed => DisposeCount > 0;
         public Memory<byte> Memory { get; } = new byte[4];
-        public void Dispose() => IsDisposed = true;
+
+        // Interlocked: Dispose может вызываться из разных потоков
+        // (consumer, eviction, drain) — считаем безопасно.
+        public void Dispose() => Interlocked.Increment(ref _disposeCount);
     }
 }

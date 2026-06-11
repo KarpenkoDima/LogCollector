@@ -12,9 +12,9 @@
     </ItemGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\..\..\NET\LogCollector\src\LogCollector.Infrastructure\LogCollector.Infrastructure.csproj" />
       <ProjectReference Include="..\LogCollector.Application\LogCollector.Application.csproj" />
       <ProjectReference Include="..\LogCollector.Core\LogCollector.Core.csproj" />
+      <ProjectReference Include="..\LogCollector.Infrastructure\LogCollector.Infrastructure.csproj" />
     </ItemGroup>
 	<ItemGroup>
 		<Content Include="appsettings.json">

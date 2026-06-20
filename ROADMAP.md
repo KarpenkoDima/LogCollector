@@ -35,17 +35,27 @@
 - [x] SocketAddress reuse
 - [x] Grafana dashboard в git
 
-## 🔜 Milestone 4 — Устойчивость к отказам (v2.2)
+## 🟡 Milestone 4 — Production-readiness (v2.2, В РАБОТЕ)
 
-Цель: деградация одного sink не влияет на остальные.
+По итогам аудита 2026-07-14. Блок P0 закрыт, P1/P2 в работе.
 
-- [ ] Независимые воркеры на канал для каждого sink
-  Сейчас `Task.WhenAll` в FanOut означает, что зависший Loki блокирует SQLite.
-  Решение: отдельный `Channel<LogEntry>` и `BackgroundService` на каждый sink.
-- [ ] Retry-стратегия для Loki при недоступности
-  Локальный WAL-буфер или очередь вместо потери батча.
-- [ ] Health-check endpoint для каждого sink
-- [ ] Метрика `dropped-entries` через EventCounters
+### ✅ P0 — до любого запуска (ЗАКРЫТО)
+- [x] P0.1 Безопасное вытеснение — OwnedIngress с явным Dispose
+- [x] P0.2 Настоящее накопление batch — окно вместо snapshot-drain
+- [x] P0.3 Корректное завершение — доказано тестами (хвост + owners=0)
+
+### 🔜 P1 — до объявления production-ready
+- [ ] P1.1 Изоляция SQLite от Loki (primary/secondary sinks)
+  Сейчас `Task.WhenAll` связывает их судьбу — зависший Loki блокирует SQLite.
+- [ ] P1.2 HTTP lifetime — Dispose response, timeout, retry-лимит, cancellation
+- [ ] P1.3 Валидация конфигурации при запуске — падать рано с понятной ошибкой
+- [ ] P1.4 Усиление парсера — битые дейтаграммы без падения
+
+### 🔮 P2 — эксплуатационная зрелость
+- [ ] P2.1 Метрики: received / parsed / sqlite_saved / channel_dropped
+- [ ] P2.2 Retention SQLite (автоочистка старых записей)
+- [ ] P2.3 Deployment hardening (systemd TimeoutStopSec, resource limits)
+- [ ] P2.4 Документация production-эксплуатации
 
 ## 🔮 Milestone 5 — Экстремальная нагрузка (v3.0)
 

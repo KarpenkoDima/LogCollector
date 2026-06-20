@@ -7,10 +7,28 @@
 
 ## [Unreleased]
 
-### Планируется
-- Независимые воркеры для каждого sink (изоляция отказа Loki от SQLite)
-- Стратегия повторных отправок при недоступности Loki (локальный WAL-буфер)
-- `SocketAsyncEventArgs` для приёма при нагрузке >100k pps
+### Добавлено (P0 fixes — production-readiness аудит 2026-07-14)
+- `IOwnedIngress` / `OwnedIngress` — owning-очередь приёма с явным drop-oldest.
+  Вытесненный `LogEntry` теперь освобождает `RawBuffer` ровно один раз (P0.1)
+- Окно накопления batch в `BatchWriterService`: batch закрывается по первому из
+  BatchSize / BatchTimeout / completion / shutdown — вместо snapshot-drain (P0.2)
+- 6 regression-тестов (`ProductionReadinessTests`), доказывающих P0.1, P0.2, P0.3
+- `DroppedCount` в ingress — задел под метрику `channel_dropped_total` (P2)
+
+### Исправлено
+- P0.1: канал с `DropOldest` вытеснял записи, не освобождая pool-буферы —
+  утечка памяти под устойчивой перегрузкой
+- P0.2: батчинг деградировал до размера 1 на реальном трафике с зазорами
+  (snapshot-drain вместо накопления окна) — 10k транзакций/сек вместо 20
+- P0.3: доказана корректность graceful shutdown — хвост сохраняется,
+  outstanding owners == 0, отсутствует double-dispose
+
+### Планируется (P1 — до объявления production-ready)
+- P1.1: изоляция SQLite от Loki (primary/secondary sinks вместо Task.WhenAll)
+- P1.2: HTTP lifetime — Dispose HttpResponseMessage, timeout, retry-лимит
+- P1.3: валидация конфигурации при запуске
+- P1.4: усиление парсера для битых дейтаграмм
+- P2: метрики (received/parsed/saved/dropped), retention, deployment hardening
 
 ## [2.1.0] - 2025-12-22
 

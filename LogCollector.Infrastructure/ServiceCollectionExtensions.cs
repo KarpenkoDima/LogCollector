@@ -1,4 +1,3 @@
-using System.Threading.Channels;
 using LogCollector.Application.Interfaces;
 using LogCollector.Core.Domain;
 using LogCollector.Infrastructure.Listeners;
@@ -7,6 +6,8 @@ using LogCollector.Infrastructure.Pipeline;
 using LogCollector.Infrastructure.Sinks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using System.Threading.Channels;
 
 namespace LogCollector.Infrastructure;
 
@@ -58,9 +59,9 @@ public static class ServiceCollectionExtensions
                 .ToDictionary(f => f.SinkType, StringComparer.OrdinalIgnoreCase);
 
             var sinksConfig = configuration
-                .GetSection("LogSinks")
-                .GetChildren()
-                .ToArray();
+               .GetSection("LogSinks")
+               .GetChildren()
+               .ToArray();
 
             if (sinksConfig.Length == 0)
                 throw new InvalidOperationException(
@@ -68,7 +69,8 @@ public static class ServiceCollectionExtensions
                     "Add at least one entry to 'LogSinks' in appsettings.json.\n" +
                     $"Available types: {string.Join(", ", factories.Keys)}");
 
-            var sinks = sinksConfig.Select(section =>
+            // Build (type, sink) pairs so we can split primary from secondaries.
+            var built = sinksConfig.Select(section =>
             {
                 var type = section["Type"]
                     ?? throw new InvalidOperationException(
@@ -79,10 +81,36 @@ public static class ServiceCollectionExtensions
                         $"No factory registered for sink type '{type}'. " +
                         $"Available: {string.Join(", ", factories.Keys)}");
 
-                return factory.Create(section, sp);
+                return (Type: type, Sink: factory.Create(section, sp));
             }).ToArray();
 
-            return new FanOutLogRepository(sinks);
+            // ── P1.1: SQLite is the mandatory PRIMARY sink ────────────────────
+            // Primary is awaited first and its failure fails the batch (real loss).
+            // Loki/Console are best-effort secondaries whose failure or hang never
+            // fails the batch. SQLite must be configured — it is the source of truth.
+            var primaryPair = built.FirstOrDefault(
+                b => string.Equals(b.Type, "Sqlite", StringComparison.OrdinalIgnoreCase));
+
+            if (primaryPair.Sink is null)
+                throw new InvalidOperationException(
+                    "A 'Sqlite' sink is required as the primary destination. " +
+                    "Add { \"Type\": \"Sqlite\", ... } to 'LogSinks'. " +
+                    "Loki/Console are best-effort secondaries and cannot be primary.");
+
+            var secondaries = built
+                .Where(b => !ReferenceEquals(b.Sink, primaryPair.Sink))
+                .Select(b => b.Sink)
+                .ToArray();
+
+            // Secondary timeout: how long a hung Loki may hold the pipeline before
+            // being skipped. Batch is already persisted by SQLite at this point.
+            var secondaryTimeout = TimeSpan.FromSeconds(5);
+
+            return new FanOutLogRepository(
+                primaryPair.Sink,
+                secondaries,
+                secondaryTimeout,
+                sp.GetRequiredService<ILogger<FanOutLogRepository>>());
         });
 
         // ── Parsers ───────────────────────────────────────────────────────────
@@ -91,7 +119,7 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton<ILogParser>(sp => new CompositeLogParser(
             sp.GetRequiredService<MikroTikSyslogParser>()
-            // sp.GetRequiredService<WinBeatLogParser>() ← and here
+        // sp.GetRequiredService<WinBeatLogParser>() ← and here
         ));
 
         // ── Owned ingress (P0.1 fix) ──────────────────────────────────────────

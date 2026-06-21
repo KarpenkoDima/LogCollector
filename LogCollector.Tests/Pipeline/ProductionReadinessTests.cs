@@ -4,6 +4,7 @@ using System.Threading.Channels;
 using LogCollector.Application.Interfaces;
 using LogCollector.Core.Domain;
 using LogCollector.Infrastructure.Pipeline;
+using LogCollector.Infrastructure.Sinks;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -275,6 +276,95 @@ public sealed class ProductionReadinessTests
         Assert.Equal(0, owners.Count(o => o.DisposeCount != 1));
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // P1.1 — Изоляция SQLite (primary) от Loki/Console (secondary)
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    // Контракт (аудит P1.1):
+    //   1. SQLite упал  → SaveBatchAsync бросает (реальная потеря batch)
+    //   2. Loki упал    → SaveBatchAsync успешен (SQLite записал)
+    //   3. Loki висит   → SaveBatchAsync не висит дольше secondary-таймаута
+    //   4. ошибки secondary НЕ проваливают batch
+
+    [Fact]
+    public async Task FanOut_PrimaryFails_ThrowsBatchConsideredLost()
+    {
+        // SQLite (primary) упал — это реальная потеря, batch провален.
+        var primary    = new FakeSink("Sqlite") { Throws = true };
+        var secondary  = new FakeSink("Loki");
+        var fan = new FanOutLogRepository(
+            primary,
+            new ILogSink[] { secondary },
+            secondaryTimeout: TimeSpan.FromSeconds(1),
+            NullLogger<FanOutLogRepository>.Instance);
+
+        // Primary бросил → SaveBatchAsync должен бросить (не проглотить).
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => fan.SaveBatchAsync(OneEntry(), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task FanOut_SecondaryFails_BatchStillSucceeds()
+    {
+        // Loki (secondary) упал — SQLite записал, значит batch сохранён.
+        var primary   = new FakeSink("Sqlite");
+        var badLoki   = new FakeSink("Loki") { Throws = true };
+        var fan = new FanOutLogRepository(
+            primary,
+            new ILogSink[] { badLoki },
+            secondaryTimeout: TimeSpan.FromSeconds(1),
+            NullLogger<FanOutLogRepository>.Instance);
+
+        // Не должно бросить — primary успешен.
+        await fan.SaveBatchAsync(OneEntry(), CancellationToken.None);
+
+        Assert.True(primary.WasCalled, "SQLite (primary) должен быть вызван");
+        Assert.True(badLoki.WasCalled, "Loki (secondary) должен быть вызван (и упасть тихо)");
+    }
+
+    [Fact]
+    public async Task FanOut_SecondaryHangs_DoesNotBlockBeyondTimeout()
+    {
+        // Loki (secondary) висит дольше таймаута — SaveBatchAsync НЕ должен
+        // висеть дольше secondaryTimeout + запас.
+        var primary    = new FakeSink("Sqlite");
+        var hangingLoki = new FakeSink("Loki") { HangMs = 10_000 };  // висит 10 сек
+        var fan = new FanOutLogRepository(
+            primary,
+            new ILogSink[] { hangingLoki },
+            secondaryTimeout: TimeSpan.FromMilliseconds(200),
+            NullLogger<FanOutLogRepository>.Instance);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await fan.SaveBatchAsync(OneEntry(), CancellationToken.None);
+        sw.Stop();
+
+        // Primary мгновенный + secondary таймаут 200мс. Общее время должно
+        // быть заметно меньше 10 секунд зависания Loki.
+        Assert.True(sw.ElapsedMilliseconds < 2_000,
+            $"SaveBatchAsync висел {sw.ElapsedMilliseconds}мс — " +
+            $"зависший secondary не должен держать конвейер дольше таймаута.");
+
+        Assert.True(primary.WasCalled);
+    }
+
+    [Fact]
+    public async Task FanOut_PrimarySucceeds_SecondaryTimesOut_BatchNotLost()
+    {
+        // Комбинация: primary ок, secondary в таймаут — batch НЕ потерян.
+        var primary     = new FakeSink("Sqlite");
+        var slowLoki    = new FakeSink("Loki") { HangMs = 5_000 };
+        var fan = new FanOutLogRepository(
+            primary,
+            new ILogSink[] { slowLoki },
+            secondaryTimeout: TimeSpan.FromMilliseconds(100),
+            NullLogger<FanOutLogRepository>.Instance);
+
+        // Не бросает — primary записал, secondary-таймаут это best-effort.
+        await fan.SaveBatchAsync(OneEntry(), CancellationToken.None);
+        Assert.True(primary.WasCalled);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static LogEntry EntryWith(IMemoryOwner<byte> owner) =>
@@ -302,6 +392,9 @@ public sealed class ProductionReadinessTests
             ReceivedAt   = DateTimeOffset.UtcNow,
             RawBuffer    = null,
         };
+
+    private static IReadOnlyList<LogEntry> OneEntry() =>
+        new[] { Entry("payload") };
 
     private static ReadOnlyMemory<byte> Bytes(string s)
         => Encoding.UTF8.GetBytes(s).AsMemory();
@@ -356,6 +449,31 @@ public sealed class ProductionReadinessTests
                 await _gate.WaitAsync(CancellationToken.None);
 
             lock (_lock) _totalSaved += batch.Count;
+        }
+    }
+
+    /// <summary>
+    /// Настраиваемый ILogSink для тестов изоляции: может бросать, висеть,
+    /// и запоминает факт вызова. Name задаётся явно для проверки логирования.
+    /// </summary>
+    private sealed class FakeSink : ILogSink
+    {
+        public FakeSink(string name) => Name = name;
+
+        public string Name { get; }
+        public bool Throws { get; init; }
+        public int HangMs { get; init; }
+        public volatile bool WasCalled;
+
+        public Task InitializeAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public async Task SaveBatchAsync(IReadOnlyList<LogEntry> batch, CancellationToken ct)
+        {
+            WasCalled = true;
+            if (HangMs > 0)
+                await Task.Delay(HangMs, ct);   // ct отменит по secondary-таймауту
+            if (Throws)
+                throw new InvalidOperationException($"{Name} simulated failure");
         }
     }
 

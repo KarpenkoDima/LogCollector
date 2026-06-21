@@ -200,7 +200,11 @@ public sealed class BatchWriterServiceTests : IAsyncLifetime
     private ILogRepository BuildSqliteRepo()
     {
         var sink = new SqliteLogSink(SqliteCs, NullLogger<SqliteLogSink>.Instance);
-        return new FanOutLogRepository(new ILogSink[] { sink });
+        return new FanOutLogRepository(
+            primary: sink,
+            secondaries: Array.Empty<ILogSink>(),
+            secondaryTimeout: TimeSpan.FromSeconds(5),
+            NullLogger<FanOutLogRepository>.Instance);
     }
 
     private (Channel<LogEntry>, BatchWriterService) BuildService(

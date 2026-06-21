@@ -9,7 +9,7 @@ namespace LogCollector.Application.Interfaces;
 /// <see cref="ILogSink"/> is to <see cref="ILogRepository"/> what <c>ISink</c> is
 /// to <c>ILogger</c> in Serilog: the interface for an individual output target.
 /// <c>FanOutLogRepository</c> implements <see cref="ILogRepository"/> by dispatching
-/// each batch to all registered <see cref="ILogSink"/> instances in parallel.
+/// each batch to to a primary sink (SQLite) and best-effort secondaries (Loki, Console).
 /// </para>
 ///
 /// <para>
@@ -20,6 +20,12 @@ namespace LogCollector.Application.Interfaces;
 /// </summary>
 public interface ILogSink
 {
+    /// <summary>
+    /// Human-readable sink name, used shen logging per-sink errors in the fan-out.
+    /// Defaults to the concrete type name; sinks may override for a friendlier label. 
+    /// </summary>
+    string Name => GetType().Name;
+
     /// <summary>
     /// One-time setup called at service startup.
     /// SQLite uses this to create the schema; Loki uses it to warm up the HTTP client.

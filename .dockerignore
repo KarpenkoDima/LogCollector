@@ -1,0 +1,25 @@
+**/.git
+**/.gitignore
+**/.vs
+**/.vscode
+**/bin
+**/obj
+**/TestResults
+
+# Test project — not needed in the build image
+LogCollector.Tests/
+
+# Development artifacts
+*.db
+*.db-shm
+*.db-wal
+dev-logs.db
+
+# Documentation
+*.md
+DESIGN_GUIDE.md
+
+# Docker files themselves (avoid recursive context)
+Dockerfile
+docker-compose*.yml
+.dockerignore

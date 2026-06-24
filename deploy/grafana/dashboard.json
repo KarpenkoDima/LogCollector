@@ -1,0 +1,134 @@
+{
+  "__inputs": [],
+  "__requires": [
+    { "type": "datasource", "id": "loki", "name": "Loki", "version": "1.0.0" }
+  ],
+  "annotations": { "list": [] },
+  "description": "MikroTik syslog overview — errors, firewall events, DHCP leases",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "reduceOptions": { "calcs": ["count"], "fields": "", "values": false },
+        "orientation": "auto",
+        "text": {},
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+          "expr": "count_over_time({app=\"logcollector\"}[$__range])",
+          "legendFormat": "Total"
+        }
+      ],
+      "title": "Total log entries",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "id": 2,
+      "options": {
+        "reduceOptions": { "calcs": ["count"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "color": { "mode": "fixed", "fixedColor": "red" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+          "expr": "count_over_time({app=\"logcollector\"} |= \"error,\" [$__range])",
+          "legendFormat": "Errors"
+        }
+      ],
+      "title": "Errors",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "id": 3,
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+          "expr": "{app=\"logcollector\", hostname=~\"$hostname\"} |~ \"$search\"",
+          "legendFormat": ""
+        }
+      ],
+      "title": "Log stream",
+      "type": "logs"
+    },
+    {
+      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" } }
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+      "id": 4,
+      "options": {
+        "fillOpacity": 20,
+        "gradientMode": "none",
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+          "expr": "sum by (hostname) (count_over_time({app=\"logcollector\"}[$__interval]))",
+          "legendFormat": "{{hostname}}"
+        }
+      ],
+      "title": "Messages per router",
+      "type": "timeseries"
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["logcollector", "mikrotik", "syslog"],
+  "templating": {
+    "list": [
+      {
+        "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+        "definition": "label_values(hostname)",
+        "hide": 0,
+        "includeAll": true,
+        "multi": true,
+        "name": "hostname",
+        "options": [],
+        "query": { "label": "hostname", "stream": "{app=\"logcollector\"}", "type": 1 },
+        "refresh": 2,
+        "type": "query",
+        "label": "Router"
+      },
+      {
+        "hide": 0,
+        "name": "search",
+        "query": "",
+        "type": "textbox",
+        "label": "Search"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "MikroTik Syslog",
+  "uid": "mikrotik-syslog-01",
+  "version": 1
+}

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!--
+      Core (Domain) has zero outward dependencies — no packages, no project references.
+      Everything in this project is plain C# that any other layer can reference freely.
+      This is the Clean Architecture dependency rule enforced at the project level.
+    -->
+  </PropertyGroup>
+
+</Project>

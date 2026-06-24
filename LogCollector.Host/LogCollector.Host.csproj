@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>LogCollector.Host</RootNamespace>
+    <AssemblyName>LogCollector.Host</AssemblyName>
+    <!--
+      Publish command for production Linux binary:
+        dotnet publish -c Release -r linux-x64 - -self-contained true
+
+      To bind port 514 without running as root, run once after publish:
+        sudo setcap cap_net_bind_service+ep ./LogCollector.Host
+
+      Alternatively, forward port 514 → 5140 at the firewall level:
+        sudo iptables -t nat -A PREROUTING -p udp - -dport 514 -j REDIRECT - -to-port 5140
+    -->
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="appsettings.Development.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+  <ItemGroup>
+    <!--
+      Microsoft.Extensions.Hosting.Systemd enables sd_notify integration
+      and journald-aware logging.  It is a no-op on all non-systemd platforms.
+    -->
+    <PackageReference Include="Microsoft.Extensions.Hosting"        Version="9.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      The Host layer is the only project that references Infrastructure.
+      Infrastructure references Core.  Core has no outward references.
+      This enforces the Clean Architecture dependency rule at the compiler level.
+    -->
+    <ProjectReference Include="..\LogCollector.Core\LogCollector.Core.csproj" />
+    <ProjectReference Include="..\LogCollector.Infrastructure\LogCollector.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,168 @@
+name: logcollector
+
+# ── Конфиги inline ────────────────────────────────────────────────────────────
+# Все конфиги встроены в compose-файл — никаких bind mount, никаких файлов на хосте.
+# Docker создаёт tmpfs-файлы внутри контейнеров. Работает одинаково на Windows/Mac/Linux.
+
+configs:
+
+  loki_config:
+    content: |
+      auth_enabled: false
+      server:
+        http_listen_port: 3100
+        log_level: warn
+      common:
+        instance_addr: 127.0.0.1
+        path_prefix: /var/loki
+        storage:
+          filesystem:
+            chunks_directory: /var/loki/chunks
+            rules_directory:  /var/loki/rules
+        replication_factor: 1
+        ring:
+          kvstore:
+            store: inmemory
+      schema_config:
+        configs:
+          - from: 2024-01-01
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index:
+              prefix: index_
+              period: 24h
+      limits_config:
+        allow_structured_metadata: false
+        retention_period: 744h
+      compactor:
+        working_directory: /var/loki/compactor
+        compaction_interval: 10m
+        retention_enabled: true
+        retention_delete_delay: 2h
+        delete_request_store: filesystem
+
+  grafana_datasource:
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Loki
+          type: loki
+          access: proxy
+          url: http://loki:3100
+          isDefault: true
+          jsonData:
+            maxLines: 1000
+
+# ── Запуск ─────────────────────────────────────────────────────────────────────
+#
+# Только SQLite:
+#   docker compose --profile sqlite up -d
+#
+# Полный стек с Loki + Grafana (http://localhost:3000, admin/admin):
+#   docker compose --profile monitoring up -d
+#
+# Тест из терминала:
+#   echo "<30>Jun  4 18:00:00 mtk-router : firewall,info test" | nc -u -w1 localhost 514
+
+services:
+
+  # ── LogCollector (SQLite only) ────────────────────────────────────────────────
+  # Профиль sqlite: стартует ТОЛЬКО при --profile sqlite.
+  # Не стартует при --profile monitoring, избегая конфликта по порту 514.
+  logcollector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["sqlite"]
+    restart: unless-stopped
+    ports:
+      - "514:5140/udp"
+    volumes:
+      - logcollector-data:/var/log/logcollector
+    environment:
+      SYSLOGLISTENER__PORT: "5140"
+      LOGSINKS__0__TYPE: "Sqlite"
+      LOGSINKS__0__CONNECTIONSTRING: "Data Source=/var/log/logcollector/logs.db"
+    networks:
+      - logcollector-net
+
+  # ── Loki ─────────────────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.0.0
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    user: "0"
+    ports:
+      - "3100:3100"
+    configs:
+      - source: loki_config
+        target: /loki-config.yaml
+        mode: 0444
+    command: -config.file=/loki-config.yaml
+    volumes:
+      - loki-data:/var/loki
+    networks:
+      - logcollector-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Grafana ───────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.0.0
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    configs:
+      # Конфиг датасорса Loki — inline, без bind mount
+      - source: grafana_datasource
+        target: /etc/grafana/provisioning/datasources/loki.yaml
+        mode: 0444
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - logcollector-net
+    depends_on:
+      loki:
+        condition: service_healthy
+
+  # ── LogCollector + Loki (monitoring profile) ──────────────────────────────────
+  logcollector-monitoring:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    ports:
+      - "514:5140/udp"
+    volumes:
+      - logcollector-data:/var/log/logcollector
+    environment:
+      SYSLOGLISTENER__PORT: "5140"
+      LOGSINKS__0__TYPE: "Sqlite"
+      LOGSINKS__0__CONNECTIONSTRING: "Data Source=/var/log/logcollector/logs.db"
+      LOGSINKS__1__TYPE: "Loki"
+      LOGSINKS__1__ENDPOINT: "http://loki:3100"
+      LOGSINKS__1__LABELS__APP: "logcollector"
+    networks:
+      - logcollector-net
+    depends_on:
+      loki:
+        condition: service_healthy
+
+volumes:
+  logcollector-data:
+  loki-data:
+  grafana-data:
+
+networks:
+  logcollector-net:
+    driver: bridge

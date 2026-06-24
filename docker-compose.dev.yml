@@ -1,0 +1,26 @@
+# Development override — use with:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# Changes from production:
+#   - Builds from source instead of a pre-built image
+#   - Exposes port 5140 directly (no 514 mapping — avoids root on dev machines)
+#   - SQLite written to ./data/ for easy inspection with any SQLite browser
+#   - Verbose logging
+#   - Console sink enabled alongside SQLite
+
+services:
+  logcollector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: build         # stop at the build stage for faster iteration
+    ports:
+      - "5140:5140/udp"     # direct access on unprivileged port
+    volumes:
+      - ./data:/var/log/logcollector   # bind mount — inspect DB with sqlitebrowser
+    environment:
+      DOTNET_ENVIRONMENT: Development
+      SYSLOGLISTENER__PORT: "5140"
+      LOGSINKS__0__TYPE: "Console"
+      LOGSINKS__1__TYPE: "Sqlite"
+      LOGSINKS__1__CONNECTIONSTRING: "Data Source=/var/log/logcollector/dev-logs.db"

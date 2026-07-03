@@ -42,17 +42,45 @@ configs:
         retention_delete_delay: 2h
         delete_request_store: filesystem
 
-  grafana_datasource:
+  # Datasources: Loki + SQLite в одном файле
+  grafana_datasources:
     content: |
       apiVersion: 1
       datasources:
+
+        # uid фиксирован — не меняется при пересоздании volume или смене имени файла.
+        # Dashboard JSON ссылается на uid, не на name.
         - name: Loki
+          uid: loki-logcollector
           type: loki
           access: proxy
           url: http://loki:3100
           isDefault: true
           jsonData:
             maxLines: 1000
+
+        # frser-sqlite-datasource — устанавливается через GF_INSTALL_PLUGINS.
+        # path: путь к файлу внутри Grafana-контейнера.
+        # Volume logcollector-data монтируется в /var/log/logcollector (read-only).
+        - name: SQLite
+          uid: sqlite-logcollector
+          type: frser-sqlite-datasource
+          access: proxy
+          jsonData:
+            path: /var/log/logcollector/logs.db
+          editable: true
+
+  # Dashboard-провайдер: откуда загружать дашборды
+  grafana_dashboards_provider:
+    content: |
+      apiVersion: 1
+      providers:
+        - name: LogCollector
+          type: file
+          disableDeletion: false
+          updateIntervalSeconds: 30
+          options:
+            path: /var/lib/grafana/dashboards
 
 # ── Запуск ─────────────────────────────────────────────────────────────────────
 #
@@ -63,13 +91,11 @@ configs:
 #   docker compose --profile monitoring up -d
 #
 # Тест из терминала:
-#   echo "<30>Jun  4 18:00:00 mtk-router : firewall,info test" | nc -u -w1 localhost 514
+#   echo "<30>Jun  4 18:00:00 mtk-router : firewall,info test" | nc -u -w1 localhost 5140
 
 services:
 
   # ── LogCollector (SQLite only) ────────────────────────────────────────────────
-  # Профиль sqlite: стартует ТОЛЬКО при --profile sqlite.
-  # Не стартует при --profile monitoring, избегая конфликта по порту 514.
   logcollector:
     build:
       context: .
@@ -116,18 +142,29 @@ services:
     image: grafana/grafana:11.0.0
     profiles: ["monitoring"]
     restart: unless-stopped
+    user: "0"
     ports:
       - "3000:3000"
     environment:
       GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
       GF_USERS_ALLOW_SIGN_UP: "false"
+      # Устанавливает плагин при каждом старте контейнера.
+      # Если плагин уже установлен в grafana-data volume — пропускается быстро.
+      GF_INSTALL_PLUGINS: "frser-sqlite-datasource"
+      # Разрешаем плагину обращаться к локальным файлам (требуется для SQLite)
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: "frser-sqlite-datasource"
     configs:
-      # Конфиг датасорса Loki — inline, без bind mount
-      - source: grafana_datasource
-        target: /etc/grafana/provisioning/datasources/loki.yaml
+      - source: grafana_datasources
+        target: /etc/grafana/provisioning/datasources/datasources.yaml
+        mode: 0444
+      - source: grafana_dashboards_provider
+        target: /etc/grafana/provisioning/dashboards/provider.yaml
         mode: 0444
     volumes:
       - grafana-data:/var/lib/grafana
+      # logcollector-data монтируется read-only: Grafana читает logs.db через плагин,
+      # но не может случайно изменить или удалить файл базы данных.
+      - logcollector-data:/var/log/logcollector:ro
     networks:
       - logcollector-net
     depends_on:

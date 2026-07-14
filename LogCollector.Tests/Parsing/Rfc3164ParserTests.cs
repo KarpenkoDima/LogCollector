@@ -45,6 +45,7 @@ public sealed class Rfc3164ParserTests
     [InlineData("")]
     [InlineData("plain text")]
     [InlineData("<>Jul 14 12:30:45 router message")]
+    [InlineData("<+30>Jul 14 12:30:45 router message")]
     [InlineData("<192>Jul 14 12:30:45 router message")]
     [InlineData("<30>Foo 14 12:30:45 router message")]
     [InlineData("<30>Jul 32 12:30:45 router message")]
@@ -64,6 +65,16 @@ public sealed class Rfc3164ParserTests
         bytes[^1] = (byte)'!';
 
         Assert.Equal("messag!", Text(entry.Message));
+    }
+
+    [Fact]
+    public void DoesNotTreatOrdinaryColonPrefixedMessageAsMikroTikTag()
+    {
+        byte[] bytes = "<30>Jul 14 12:30:45 router : ordinary message"u8.ToArray();
+
+        Assert.True(_parser.TryParse(bytes, ReceivedAt, out LogEntry entry));
+        Assert.True(entry.Topic.IsEmpty);
+        Assert.Equal(": ordinary message", Text(entry.Message));
     }
 
     private static string Text(ReadOnlyMemory<byte> value) => Encoding.UTF8.GetString(value.Span);

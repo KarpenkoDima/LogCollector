@@ -29,6 +29,7 @@ public sealed class Rfc3164Parser : ILogParser
 
         int close = source.IndexOf((byte)'>');
         if (close is < 2 or > 4 ||
+            !IsAsciiDigits(source[1..close]) ||
             !Utf8Parser.TryParse(source[1..close], out int priority, out int consumed) ||
             consumed != close - 1 || priority is < 0 or > 191)
         {
@@ -57,17 +58,17 @@ public sealed class Rfc3164Parser : ILogParser
         ReadOnlyMemory<byte> topic = ReadOnlyMemory<byte>.Empty;
         if (cursor < source.Length && source[cursor] == ':')
         {
-            cursor = SkipSpaces(source, cursor + 1);
-            int tagLength = source[cursor..].IndexOf((byte)' ');
+            int tagStart = SkipSpaces(source, cursor + 1);
+            int tagLength = source[tagStart..].IndexOf((byte)' ');
             if (tagLength > 0)
             {
-                ReadOnlySpan<byte> tag = source.Slice(cursor, tagLength);
+                ReadOnlySpan<byte> tag = source.Slice(tagStart, tagLength);
                 int comma = tag.IndexOf((byte)',');
                 if (comma > 0)
-                    topic = payload.Slice(cursor, comma);
-
-                cursor += tagLength;
-                cursor = SkipSpaces(source, cursor);
+                {
+                    topic = payload.Slice(tagStart, comma);
+                    cursor = SkipSpaces(source, tagStart + tagLength);
+                }
             }
         }
 
@@ -121,6 +122,17 @@ public sealed class Rfc3164Parser : ILogParser
         }
 
         result = (first == ' ' ? 0 : first - '0') * 10 + second - '0';
+        return true;
+    }
+
+    private static bool IsAsciiDigits(ReadOnlySpan<byte> value)
+    {
+        foreach (byte item in value)
+        {
+            if (item is < (byte)'0' or > (byte)'9')
+                return false;
+        }
+
         return true;
     }
 

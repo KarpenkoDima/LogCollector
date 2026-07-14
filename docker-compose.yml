@@ -1,205 +1,26 @@
 name: logcollector
 
-# ── Конфиги inline ────────────────────────────────────────────────────────────
-# Все конфиги встроены в compose-файл — никаких bind mount, никаких файлов на хосте.
-# Docker создаёт tmpfs-файлы внутри контейнеров. Работает одинаково на Windows/Mac/Linux.
-
-configs:
-
-  loki_config:
-    content: |
-      auth_enabled: false
-      server:
-        http_listen_port: 3100
-        log_level: warn
-      common:
-        instance_addr: 127.0.0.1
-        path_prefix: /var/loki
-        storage:
-          filesystem:
-            chunks_directory: /var/loki/chunks
-            rules_directory:  /var/loki/rules
-        replication_factor: 1
-        ring:
-          kvstore:
-            store: inmemory
-      schema_config:
-        configs:
-          - from: 2024-01-01
-            store: tsdb
-            object_store: filesystem
-            schema: v13
-            index:
-              prefix: index_
-              period: 24h
-      limits_config:
-        allow_structured_metadata: false
-        retention_period: 744h
-      compactor:
-        working_directory: /var/loki/compactor
-        compaction_interval: 10m
-        retention_enabled: true
-        retention_delete_delay: 2h
-        delete_request_store: filesystem
-
-  # Datasources: Loki + SQLite в одном файле
-  grafana_datasources:
-    content: |
-      apiVersion: 1
-      datasources:
-
-        # uid фиксирован — не меняется при пересоздании volume или смене имени файла.
-        # Dashboard JSON ссылается на uid, не на name.
-        - name: Loki
-          uid: loki-logcollector
-          type: loki
-          access: proxy
-          url: http://loki:3100
-          isDefault: true
-          jsonData:
-            maxLines: 1000
-
-        # frser-sqlite-datasource — устанавливается через GF_INSTALL_PLUGINS.
-        # path: путь к файлу внутри Grafana-контейнера.
-        # Volume logcollector-data монтируется в /var/log/logcollector (read-only).
-        - name: SQLite
-          uid: sqlite-logcollector
-          type: frser-sqlite-datasource
-          access: proxy
-          jsonData:
-            path: /var/log/logcollector/logs.db
-          editable: true
-
-  # Dashboard-провайдер: откуда загружать дашборды
-  grafana_dashboards_provider:
-    content: |
-      apiVersion: 1
-      providers:
-        - name: LogCollector
-          type: file
-          disableDeletion: false
-          updateIntervalSeconds: 30
-          options:
-            path: /var/lib/grafana/dashboards
-
-# ── Запуск ─────────────────────────────────────────────────────────────────────
-#
-# Только SQLite:
-#   docker compose --profile sqlite up -d
-#
-# Полный стек с Loki + Grafana (http://localhost:3000, admin/admin):
-#   docker compose --profile monitoring up -d
-#
-# Тест из терминала:
-#   echo "<30>Jun  4 18:00:00 mtk-router : firewall,info test" | nc -u -w1 localhost 5140
-
 services:
-
-  # ── LogCollector (SQLite only) ────────────────────────────────────────────────
   logcollector:
     build:
       context: .
       dockerfile: Dockerfile
-    profiles: ["sqlite"]
+    image: logcollector:local
     restart: unless-stopped
+    read_only: true
     ports:
-      - "5140:5140/udp"
+      - "514:5140/udp"
     volumes:
-      - logcollector-data:/var/log/logcollector
+      - logcollector-data:/app/data
+    tmpfs:
+      - /tmp:size=8m,mode=1777
     environment:
-      SYSLOGLISTENER__PORT: "5140"
-      LOGSINKS__0__TYPE: "Sqlite"
-      LOGSINKS__0__CONNECTIONSTRING: "Data Source=/var/log/logcollector/logs.db"
-    networks:
-      - logcollector-net
-
-  # ── Loki ─────────────────────────────────────────────────────────────────────
-  loki:
-    image: grafana/loki:3.0.0
-    profiles: ["monitoring"]
-    restart: unless-stopped
-    user: "0"
-    ports:
-      - "3100:3100"
-    configs:
-      - source: loki_config
-        target: /loki-config.yaml
-        mode: 0444
-    command: -config.file=/loki-config.yaml
-    volumes:
-      - loki-data:/var/loki
-    networks:
-      - logcollector-net
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-
-  # ── Grafana ───────────────────────────────────────────────────────────────────
-  grafana:
-    image: grafana/grafana:11.0.0
-    profiles: ["monitoring"]
-    restart: unless-stopped
-    user: "0"
-    ports:
-      - "3000:3000"
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
-      GF_USERS_ALLOW_SIGN_UP: "false"
-      # Устанавливает плагин при каждом старте контейнера.
-      # Если плагин уже установлен в grafana-data volume — пропускается быстро.
-      GF_INSTALL_PLUGINS: "frser-sqlite-datasource"
-      # Разрешаем плагину обращаться к локальным файлам (требуется для SQLite)
-      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: "frser-sqlite-datasource"
-    configs:
-      - source: grafana_datasources
-        target: /etc/grafana/provisioning/datasources/datasources.yaml
-        mode: 0444
-      - source: grafana_dashboards_provider
-        target: /etc/grafana/provisioning/dashboards/provider.yaml
-        mode: 0444
-    volumes:
-      - grafana-data:/var/lib/grafana
-      # logcollector-data монтируется read-only: Grafana читает logs.db через плагин,
-      # но не может случайно изменить или удалить файл базы данных.
-      - logcollector-data:/var/log/logcollector:ro
-    networks:
-      - logcollector-net
-    depends_on:
-      loki:
-        condition: service_healthy
-
-  # ── LogCollector + Loki (monitoring profile) ──────────────────────────────────
-  logcollector-monitoring:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    profiles: ["monitoring"]
-    restart: unless-stopped
-    ports:
-      - "5140:5140/udp"
-    volumes:
-      - logcollector-data:/var/log/logcollector
-    environment:
-      SYSLOGLISTENER__PORT: "5140"
-      LOGSINKS__0__TYPE: "Sqlite"
-      LOGSINKS__0__CONNECTIONSTRING: "Data Source=/var/log/logcollector/logs.db"
-      LOGSINKS__1__TYPE: "Loki"
-      LOGSINKS__1__ENDPOINT: "http://loki:3100"
-      LOGSINKS__1__LABELS__app: "logcollector"
-    networks:
-      - logcollector-net
-    depends_on:
-      loki:
-        condition: service_healthy
+      UDPListener__Port: "5140"
+      SQLite__ConnectionString: "Data Source=/app/data/logs.db;Cache=Shared"
+    mem_limit: 128m
+    cpus: 1.0
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   logcollector-data:
-  loki-data:
-  grafana-data:
-
-networks:
-  logcollector-net:
-    driver: bridge

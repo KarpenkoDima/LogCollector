@@ -1,36 +1,17 @@
-# Build artifacts
 **/bin/
 **/obj/
 **/TestResults/
+.artifacts/
+data/
 
-# SQLite runtime files (created by the running service)
 *.db
 *.db-shm
 *.db-wal
-dev-logs.db
 
-# IDE
 .vs/
 .vscode/
+.idea/
 *.user
 
-# OS
 .DS_Store
 Thumbs.db
-
-# Scripts — helpers, not part of the deliverable
-setup-git-history.sh
-git-finish.sh
-
-# Root-level deploy file copies (canonical versions are in deploy/)
-config.yaml
-datasources.yaml
-loki-config.yaml
-grafana-datasources.yaml
-grafana-dashboard.json
-grafana-dashboard-provider.yaml
-log-new.txt
-setup-git-history-existing.sh
-
-# JetBrains
-.idea/

@@ -67,8 +67,6 @@ public static class ServiceCollectionExtensions
             .ValidateOnStart();
 
         services.AddSingleton<ILogParser, Rfc3164Parser>();
-        services.AddSingleton<SqliteLogRepository>();
-
         bool lokiEnabled = configuration.GetValue<bool>($"{LokiOptions.SectionName}:Enabled");
         if (lokiEnabled)
         {
@@ -82,10 +80,16 @@ public static class ServiceCollectionExtensions
                 provider.GetRequiredService<LokiLogPublisher>());
         }
 
-        services.AddSingleton<ILogRepository>(provider => new ObservedLogRepository(
-            provider.GetRequiredService<SqliteLogRepository>(),
-            provider.GetServices<ILogObserver>(),
-            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<ObservedLogRepository>>()));
+        services.AddSingleton<ILogRepository>(provider =>
+        {
+            // ActivatorUtilities creates the primary without registering it as a second
+            // disposable singleton; ObservedLogRepository is its sole owner.
+            var primary = ActivatorUtilities.CreateInstance<SqliteLogRepository>(provider);
+            return new ObservedLogRepository(
+                primary,
+                provider.GetServices<ILogObserver>(),
+                provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<ObservedLogRepository>>());
+        });
 
         services.AddSingleton(provider =>
         {

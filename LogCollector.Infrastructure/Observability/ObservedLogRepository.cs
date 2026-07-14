@@ -50,8 +50,7 @@ public sealed partial class ObservedLogRepository : ILogRepository
         }
     }
 
-    // The DI container owns and disposes the concrete primary repository.
-    public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    public ValueTask DisposeAsync() => _primary.DisposeAsync();
 
     [LoggerMessage(EventId = 200, Level = LogLevel.Warning,
         Message = "Log observer {Observer} failed; the batch remains safely stored in SQLite")]

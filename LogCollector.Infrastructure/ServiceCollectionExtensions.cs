@@ -4,6 +4,7 @@ using LogCollector.Application.Interfaces;
 using LogCollector.Application.Pipeline;
 using LogCollector.Core.Domain;
 using LogCollector.Infrastructure.Networking;
+using LogCollector.Infrastructure.Observability;
 using LogCollector.Infrastructure.Parsing;
 using LogCollector.Infrastructure.Persistence;
 using LogCollector.Infrastructure.Pipeline;
@@ -51,8 +52,40 @@ public static class ServiceCollectionExtensions
                 "Sqlite:BusyTimeoutSeconds must be between 1 and 300.")
             .ValidateOnStart();
 
+        services.AddOptions<LokiOptions>()
+            .Bind(configuration.GetSection(LokiOptions.SectionName))
+            .Validate(options => !options.Enabled ||
+                (Uri.TryCreate(options.Endpoint, UriKind.Absolute, out Uri? endpoint) &&
+                 endpoint.Scheme is "http" or "https"),
+                "Loki:Endpoint must be an absolute HTTP or HTTPS URL.")
+            .Validate(options => options.Timeout > TimeSpan.Zero,
+                "Loki:Timeout must be positive.")
+            .Validate(options => options.Labels.All(label =>
+                    IsValidLokiLabelName(label.Key) &&
+                    label.Key is not "hostname" and not "topic" and not "severity"),
+                "Loki label names must be valid and must not replace hostname, topic, or severity.")
+            .ValidateOnStart();
+
         services.AddSingleton<ILogParser, Rfc3164Parser>();
-        services.AddSingleton<ILogRepository, SqliteLogRepository>();
+        services.AddSingleton<SqliteLogRepository>();
+
+        bool lokiEnabled = configuration.GetValue<bool>($"{LokiOptions.SectionName}:Enabled");
+        if (lokiEnabled)
+        {
+            services.AddHttpClient<LokiLogPublisher>((provider, client) =>
+            {
+                LokiOptions options = provider.GetRequiredService<IOptions<LokiOptions>>().Value;
+                client.BaseAddress = new Uri(options.Endpoint.TrimEnd('/') + "/", UriKind.Absolute);
+                client.Timeout = options.Timeout;
+            });
+            services.AddSingleton<ILogObserver>(provider =>
+                provider.GetRequiredService<LokiLogPublisher>());
+        }
+
+        services.AddSingleton<ILogRepository>(provider => new ObservedLogRepository(
+            provider.GetRequiredService<SqliteLogRepository>(),
+            provider.GetServices<ILogObserver>(),
+            provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<ObservedLogRepository>>()));
 
         services.AddSingleton(provider =>
         {
@@ -77,5 +110,19 @@ public static class ServiceCollectionExtensions
         services.AddHostedService<BatchWriterService>();
         services.AddHostedService<UdpSyslogListener>();
         return services;
+    }
+
+    private static bool IsValidLokiLabelName(string name)
+    {
+        if (name.Length == 0 || !(name[0] == '_' || char.IsAsciiLetter(name[0])))
+            return false;
+
+        for (int i = 1; i < name.Length; i++)
+        {
+            if (name[i] != '_' && !char.IsAsciiLetterOrDigit(name[i]))
+                return false;
+        }
+
+        return true;
     }
 }

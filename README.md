@@ -95,7 +95,7 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 | `UdpListener` | `Address` | `0.0.0.0` | адрес bind |
 | `UdpListener` | `Port` | `5140` | UDP-порт |
 | `UdpListener` | `MaxDatagramSize` | `8192` | максимальный размер сообщения |
-| `Pipeline` | `Capacity` | `10000` | верхняя граница очереди |
+| `Pipeline` | `Capacity` | `2048` | верхняя граница очереди (~16 МБ payload при буфере 8192) |
 | `Pipeline` | `BatchSize` | `500` | максимум строк в транзакции |
 | `Pipeline` | `FlushInterval` | `00:00:02` | максимальная задержка неполного batch |
 | `Pipeline` | `RetryDelay` | `00:00:01` | пауза после ошибки SQLite |

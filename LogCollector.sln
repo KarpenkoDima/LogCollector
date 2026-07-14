@@ -12,8 +12,6 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LogCollector.Host", "LogCol
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LogCollector.Tests", "LogCollector.Tests\LogCollector.Tests.csproj", "{17FC695A-07A0-CA6E-0822-E8F36C031199}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LogCollector.Benchmarks", "LogCollector.Benchmarks\LogCollector.Benchmarks.csproj", "{5EF80601-14AA-1BD2-219C-3CA8748928C1}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -40,12 +38,5 @@ Global
 		{17FC695A-07A0-CA6E-0822-E8F36C031199}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{17FC695A-07A0-CA6E-0822-E8F36C031199}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{17FC695A-07A0-CA6E-0822-E8F36C031199}.Release|Any CPU.Build.0 = Release|Any CPU
-		{5EF80601-14AA-1BD2-219C-3CA8748928C1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{5EF80601-14AA-1BD2-219C-3CA8748928C1}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{5EF80601-14AA-1BD2-219C-3CA8748928C1}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{5EF80601-14AA-1BD2-219C-3CA8748928C1}.Release|Any CPU.Build.0 = Release|Any CPU
-	EndGlobalSection
-	GlobalSection(SolutionProperties) = preSolution
-		HideSolutionNode = FALSE
 	EndGlobalSection
 EndGlobal

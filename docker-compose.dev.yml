@@ -1,5 +1,6 @@
 services:
   logcollector:
+    profiles: ["sqlite"]
     ports:
       - "5140:5140/udp"
     environment:

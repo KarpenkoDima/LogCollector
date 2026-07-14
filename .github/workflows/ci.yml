@@ -19,4 +19,12 @@ jobs:
       - run: dotnet restore LogCollector.sln
       - run: dotnet format LogCollector.sln --verify-no-changes --no-restore
       - run: dotnet test LogCollector.sln --configuration Release --no-restore
+      - run: docker compose --profile monitoring config
       - run: docker build --tag logcollector:ci .
+      - name: Validate Loki configuration
+        run: >-
+          docker run --rm
+          --volume "$PWD/deploy/loki:/config:ro"
+          grafana/loki:3.7.3
+          -config.file=/config/loki-config.yaml
+          -verify-config=true

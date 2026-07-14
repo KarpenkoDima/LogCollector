@@ -1,26 +1,78 @@
 name: logcollector
 
+x-collector: &collector
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: logcollector:local
+  restart: unless-stopped
+  read_only: true
+  ports:
+    - "514:5140/udp"
+  volumes:
+    - logcollector-data:/app/data
+  tmpfs:
+    - /tmp:size=8m,mode=1777
+  mem_limit: 128m
+  cpus: 1.0
+  security_opt:
+    - no-new-privileges:true
+
 services:
   logcollector:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: logcollector:local
-    restart: unless-stopped
-    read_only: true
-    ports:
-      - "514:5140/udp"
-    volumes:
-      - logcollector-data:/app/data
-    tmpfs:
-      - /tmp:size=8m,mode=1777
+    <<: *collector
+    profiles: ["sqlite"]
     environment:
       UDPListener__Port: "5140"
       SQLite__ConnectionString: "Data Source=/app/data/logs.db;Cache=Shared"
-    mem_limit: 128m
-    cpus: 1.0
+      Loki__Enabled: "false"
+
+  logcollector-monitoring:
+    <<: *collector
+    profiles: ["monitoring"]
+    environment:
+      UDPListener__Port: "5140"
+      SQLite__ConnectionString: "Data Source=/app/data/logs.db;Cache=Shared"
+      Loki__Enabled: "true"
+      Loki__Endpoint: "http://loki:3100"
+      Loki__Labels__app: "logcollector"
+      Loki__Labels__environment: "docker"
+    depends_on:
+      - loki
+
+  loki:
+    image: grafana/loki:3.7.3
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yaml
+    volumes:
+      - ./deploy/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+    mem_limit: 512m
+    security_opt:
+      - no-new-privileges:true
+
+  grafana:
+    image: grafana/grafana:12.4.0
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: "admin"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - loki
+    mem_limit: 256m
     security_opt:
       - no-new-privileges:true
 
 volumes:
   logcollector-data:
+  loki-data:
+  grafana-data:

@@ -10,6 +10,8 @@
 - bounded `Channel<LogEntry>` с контролем памяти;
 - пакетная запись через Dapper в одну SQLite-транзакцию;
 - WAL, индексы по времени и устройству, повтор записи при временной ошибке;
+- опциональная отправка сохранённых batch в Loki;
+- автоматически настроенные Grafana datasource и dashboard;
 - корректное освобождение pooled-буферов и drain очереди при остановке;
 - валидация конфигурации, systemd, Docker и end-to-end тест.
 
@@ -28,6 +30,9 @@ UdpSyslogListener ──► Rfc3164Parser ──► bounded Channel<LogEntry>
                                               │ batch + transaction
                                               ▼
                                       SqliteLogRepository
+                                              │ best effort
+                                              ▼
+                                             Loki ──► Grafana
 ```
 
 - `LogCollector.Core` — доменные типы, без внешних зависимостей.
@@ -73,17 +78,29 @@ add action=logcollector topics=warning
 
 ## Docker
 
+Только коллектор с SQLite:
+
 ```bash
-docker compose up -d --build
-docker compose logs -f
+docker compose --profile sqlite up -d --build
+docker compose --profile sqlite logs -f
 ```
 
-Compose публикует стандартный `514/udp`, внутри непривилегированный контейнер слушает `5140/udp`. База хранится в volume `logcollector-data`.
+Полный monitoring stack — LogCollector, SQLite, Loki и Grafana:
+
+```bash
+export GRAFANA_PASSWORD='change-this-password'
+docker compose --profile monitoring up -d --build
+docker compose --profile monitoring ps
+```
+
+Откройте `http://IP_СЕРВЕРА:3000`, войдите как `admin` с паролем из `GRAFANA_PASSWORD` и выберите dashboard **LogCollector / MikroTik Log Collector**. Datasource Loki и dashboard создаются автоматически.
+
+Compose публикует стандартный `514/udp`, внутри непривилегированный collector слушает `5140/udp`. SQLite, Loki и Grafana используют отдельные named volumes. HTTP-порт Loki наружу намеренно не публикуется: Loki не содержит встроенного слоя аутентификации.
 
 Разработка с портом 5140 и каталогом `./data`:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml --profile sqlite up --build
 ```
 
 ## Конфигурация
@@ -101,6 +118,10 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 | `Pipeline` | `RetryDelay` | `00:00:01` | пауза после ошибки SQLite |
 | `Sqlite` | `ConnectionString` | `Data Source=logs.db` | расположение базы |
 | `Sqlite` | `BusyTimeoutSeconds` | `5` | ожидание занятой SQLite |
+| `Loki` | `Enabled` | `false` | включить публикацию после SQLite |
+| `Loki` | `Endpoint` | `http://loki:3100` | внутренний URL Loki |
+| `Loki` | `Timeout` | `00:00:05` | ограничение HTTP-запроса |
+| `Loki` | `Labels` | `app=logcollector` | дополнительные низкокардинальные labels |
 
 Таблица `logs` содержит `priority`, `facility`, `severity`, исходный timestamp устройства, hostname, topic, message и UTC-время приёма в Unix milliseconds.
 
@@ -109,3 +130,20 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 UDP не имеет настоящего backpressure. Когда SQLite не успевает, bounded channel останавливает чтение сокета; после заполнения socket buffer ядро начнёт отбрасывать новые datagram. Это сохраняет ограниченное потребление памяти, но не гарантирует доставку — для гарантированной доставки нужен TCP или брокер сообщений.
 
 `MemoryPool<byte>` уменьшает число больших массивов, но аренда ownership-объекта всё ещё может создавать небольшую служебную аллокацию. Поэтому формулировка здесь честная: парсинг и выделение полей zero-copy, а не «абсолютный zero-allocation всего процесса».
+
+SQLite является первичным хранилищем. Loki получает batch только после успешного COMMIT. Ошибка Loki записывается как warning, но не останавливает collector и не приводит к повторной вставке строк в SQLite. Это осознанный best-effort режим: при недоступности Loki данные остаются в SQLite, но автоматически не догружаются в Loki после восстановления.
+
+Проверка monitoring stack на Linux:
+
+```bash
+printf '<132>Jul 14 12:30:45 edge-router : firewall,info grafana-test\n' \
+  | nc -u -w1 127.0.0.1 514
+
+docker compose --profile monitoring logs --tail=100 logcollector-monitoring loki grafana
+```
+
+В Grafana Explore используйте LogQL:
+
+```logql
+{app="logcollector"}
+```

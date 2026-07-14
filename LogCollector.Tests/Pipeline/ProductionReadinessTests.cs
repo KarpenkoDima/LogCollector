@@ -32,40 +32,55 @@ public sealed class ProductionReadinessTests
     // это исключает любые гонки и делает падение детерминированным.
 
     [Fact]
-    public async Task DropOldest_EvictsEntry_WithoutDisposingItsBuffer_LEAK()
+    public void OwnedIngress_EvictsOldest_AndDisposesItsBuffer_ExactlyOnce()
     {
-        // Arrange: канал ёмкости 1 с политикой DropOldest — та же политика,
-        // что в production (ServiceCollectionExtensions). Ёмкость 1 делает
-        // переполнение детерминированным на второй записи.
-        var channel = Channel.CreateBounded<LogEntry>(
-            new BoundedChannelOptions(1)
-            {
-                FullMode     = BoundedChannelFullMode.DropOldest,
-                SingleReader = true,
-                SingleWriter = false,
-            });
+        // Arrange: OwnedIngress ёмкости 1. Ёмкость 1 делает переполнение
+        // детерминированным на второй записи. Reader НЕ подключён — иначе
+        // он вычитает A раньше вытеснения.
+        var ingress = new OwnedIngress(capacity: 1);
 
-        var evictedOwner = new TrackingOwner();   // owner записи, которую вытеснят
+        var evictedOwner   = new TrackingOwner();  // owner записи, которую вытеснят
         var survivingOwner = new TrackingOwner();  // owner записи, которая останется
 
-        // Act: пишем A (занимает единственный слот), затем B (вытесняет A).
-        // Reader НЕ подключён — иначе он вычитает A раньше вытеснения.
-        await channel.Writer.WriteAsync(EntryWith(evictedOwner));
-        await channel.Writer.WriteAsync(EntryWith(survivingOwner));  // A вытеснен здесь
+        // Act: A занимает единственный слот, B вытесняет A.
+        var r1 = ingress.TryEnqueue(EntryWith(evictedOwner));
+        var r2 = ingress.TryEnqueue(EntryWith(survivingOwner));
 
-        // Assert: вытеснённый owner ДОЛЖЕН быть освобождён.
-        //
-        // НА ТЕКУЩЕМ КОДЕ ЭТОТ ASSERT ПАДАЕТ:
-        // BoundedChannelFullMode.DropOldest молча отбрасывает A, не зная
-        // про ownership — Dispose() не вызывается, буфер утекает из пула.
+        // Assert: первая принята без вытеснения, вторая вытеснила старейшую.
+        Assert.Equal(EnqueueResult.Accepted, r1);
+        Assert.Equal(EnqueueResult.DroppedOldest, r2);
+
+        // Ключевой assert P0.1: вытеснённый owner освобождён (фикс работает).
         Assert.True(evictedOwner.IsDisposed,
-            "P0.1 ДЕФЕКТ: вытеснённый по DropOldest LogEntry не освободил RawBuffer. " +
-            "Под нагрузкой это растит pressure на MemoryPool и GC. " +
-            "Фикс: явный owned ingress с Dispose() вытесняемого элемента.");
+            "P0.1: вытеснённый по drop-oldest LogEntry должен освободить RawBuffer.");
 
-        // Sanity: выжившая запись НЕ должна быть освобождена (она ещё в канале)
+        // Счётчик drops увеличился ровно на один.
+        Assert.Equal(1, ingress.DroppedCount);
+
+        // Выжившая запись НЕ освобождена — она всё ещё в очереди.
         Assert.False(survivingOwner.IsDisposed,
             "Выжившая запись не должна быть освобождена — она всё ещё в очереди.");
+
+        // Дочитываем выжившую и проверяем, что это именно B (survivingOwner).
+        Assert.True(ingress.Reader.TryRead(out var remaining));
+        Assert.Same(survivingOwner, remaining.RawBuffer);
+    }
+
+    [Fact]
+    public void OwnedIngress_NoOverflow_DoesNotDisposeAnything()
+    {
+        // Sanity: если переполнения нет, ничего не диспозится и drops=0.
+        var ingress = new OwnedIngress(capacity: 4);
+
+        var o1 = new TrackingOwner();
+        var o2 = new TrackingOwner();
+
+        Assert.Equal(EnqueueResult.Accepted, ingress.TryEnqueue(EntryWith(o1)));
+        Assert.Equal(EnqueueResult.Accepted, ingress.TryEnqueue(EntryWith(o2)));
+
+        Assert.False(o1.IsDisposed);
+        Assert.False(o2.IsDisposed);
+        Assert.Equal(0, ingress.DroppedCount);
     }
 
     // ══════════════════════════════════════════════════════════════════════════

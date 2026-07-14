@@ -94,19 +94,17 @@ public static class ServiceCollectionExtensions
             // sp.GetRequiredService<WinBeatLogParser>() ← and here
         ));
 
-        // ── Channel ───────────────────────────────────────────────────────────
-        // DropOldest: UDP has no backpressure — keep freshest data under overload.
-        services.AddSingleton(_ => Channel.CreateBounded<LogEntry>(
-            new BoundedChannelOptions(capacity: 10_000)
-            {
-                FullMode                      = BoundedChannelFullMode.DropOldest,
-                SingleWriter                  = true,
-                SingleReader                  = true,
-                AllowSynchronousContinuations = false,
-            }));
+        // ── Owned ingress (P0.1 fix) ──────────────────────────────────────────
+        // Раньше здесь был голый Channel с FullMode.DropOldest. Дефект: канал
+        // вытеснял LogEntry, НЕ вызывая RawBuffer.Dispose() — утечка pool-буферов
+        // под нагрузкой. OwnedIngress реализует drop-oldest ЯВНО, с Dispose
+        // вытесняемого буфера ровно один раз. Политика «freshest wins» сохранена.
+        services.AddSingleton<IOwnedIngress>(_ => new OwnedIngress(capacity: 10_000));
 
-        services.AddSingleton(sp => sp.GetRequiredService<Channel<LogEntry>>().Writer);
-        services.AddSingleton(sp => sp.GetRequiredService<Channel<LogEntry>>().Reader);
+        // Reader для BatchWriterService — берём из ingress, сигнатура сервиса
+        // не меняется (он по-прежнему принимает ChannelReader<LogEntry>).
+        services.AddSingleton(sp =>
+            sp.GetRequiredService<IOwnedIngress>().Reader);
 
         // ── Hosted Services ───────────────────────────────────────────────────
         services.AddHostedService<BatchWriterService>();  // stopped last  — drains

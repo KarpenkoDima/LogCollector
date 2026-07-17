@@ -23,8 +23,18 @@
 - P0.3: доказана корректность graceful shutdown — хвост сохраняется,
   outstanding owners == 0, отсутствует double-dispose
 
+### Добавлено (P1.1 — изоляция хранилищ)
+- `FanOutLogRepository` переведён на модель primary/secondary вместо `Task.WhenAll`.
+  SQLite — обязательный primary (его падение проваливает batch), Loki/Console —
+  best-effort secondaries с таймаутом 5с (их падение/зависание не влияет на batch)
+- `ILogSink.Name` — для логирования ошибок secondary по имени sink
+- 4 regression-теста изоляции (primary-fails, secondary-fails, secondary-hangs, combo)
+
+### Исправлено (P1.1)
+- Зависший Loki больше не блокирует запись в SQLite (был `Task.WhenAll` на все sinks)
+- Падение Loki больше не показывается как «batch dropped» при успешном SQLite
+
 ### Планируется (P1 — до объявления production-ready)
-- P1.1: изоляция SQLite от Loki (primary/secondary sinks вместо Task.WhenAll)
 - P1.2: HTTP lifetime — Dispose HttpResponseMessage, timeout, retry-лимит
 - P1.3: валидация конфигурации при запуске
 - P1.4: усиление парсера для битых дейтаграмм

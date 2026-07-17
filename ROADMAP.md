@@ -45,8 +45,8 @@
 - [x] P0.3 Корректное завершение — доказано тестами (хвост + owners=0)
 
 ### 🔜 P1 — до объявления production-ready
-- [ ] P1.1 Изоляция SQLite от Loki (primary/secondary sinks)
-  Сейчас `Task.WhenAll` связывает их судьбу — зависший Loki блокирует SQLite.
+- [x] P1.1 Изоляция SQLite от Loki (primary/secondary sinks) — ЗАКРЫТО
+  Разорван `Task.WhenAll`: SQLite primary, Loki/Console best-effort с таймаутом.
 - [ ] P1.2 HTTP lifetime — Dispose response, timeout, retry-лимит, cancellation
 - [ ] P1.3 Валидация конфигурации при запуске — падать рано с понятной ошибкой
 - [ ] P1.4 Усиление парсера — битые дейтаграммы без падения

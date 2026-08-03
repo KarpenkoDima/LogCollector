@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using LogCollector.Application.Interfaces;
 using LogCollector.Core.Domain;
 using LogCollector.Infrastructure.Listeners;
@@ -7,7 +8,7 @@ using LogCollector.Infrastructure.Sinks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using System.Threading.Channels;
+using Microsoft.Extensions.Options;
 
 namespace LogCollector.Infrastructure;
 
@@ -31,8 +32,21 @@ public static class ServiceCollectionExtensions
     {
         // ── Options ───────────────────────────────────────────────────────────
  
-        services.Configure<BatchWriterOptions>(configuration.GetSection("BatchWriter"));
-        services.Configure<SyslogListenerOptions>(configuration.GetSection("SyslogListener"));
+        // ── Options with startup validation (P1.3) ────────────────────────────
+        // AddOptions + Validate + ValidateOnStart: a bad value crashes the host
+        // at boot with a clear message, before any traffic is accepted, instead
+        // of failing silently or much later on first use.
+        services.AddOptions<BatchWriterOptions>()
+            .Bind(configuration.GetSection("BatchWriter"))
+            .ValidateOnStart();
+        services.AddSingleton<IValidateOptions<BatchWriterOptions>,
+            BatchWriterOptionsValidator>();
+
+        services.AddOptions<SyslogListenerOptions>()
+            .Bind(configuration.GetSection("SyslogListener"))
+            .ValidateOnStart();
+        services.AddSingleton<IValidateOptions<SyslogListenerOptions>,
+            SyslogListenerOptionsValidator>();
 
         // ── Sink factories ────────────────────────────────────────────────────
         // Register one ISinkFactory per supported destination type.
@@ -59,9 +73,9 @@ public static class ServiceCollectionExtensions
                 .ToDictionary(f => f.SinkType, StringComparer.OrdinalIgnoreCase);
 
             var sinksConfig = configuration
-               .GetSection("LogSinks")
-               .GetChildren()
-               .ToArray();
+                .GetSection("LogSinks")
+                .GetChildren()
+                .ToArray();
 
             if (sinksConfig.Length == 0)
                 throw new InvalidOperationException(
@@ -91,11 +105,20 @@ public static class ServiceCollectionExtensions
             var primaryPair = built.FirstOrDefault(
                 b => string.Equals(b.Type, "Sqlite", StringComparison.OrdinalIgnoreCase));
 
-            if (primaryPair.Sink is null)
+            // P1.3: ровно один SQLite primary — ноль или несколько это ошибка конфига.
+            var sqliteCount = built.Count(
+                b => string.Equals(b.Type, "Sqlite", StringComparison.OrdinalIgnoreCase));
+
+            if (sqliteCount == 0)
                 throw new InvalidOperationException(
                     "A 'Sqlite' sink is required as the primary destination. " +
                     "Add { \"Type\": \"Sqlite\", ... } to 'LogSinks'. " +
                     "Loki/Console are best-effort secondaries and cannot be primary.");
+
+            if (sqliteCount > 1)
+                throw new InvalidOperationException(
+                    $"Exactly one 'Sqlite' primary sink is allowed, found {sqliteCount}. " +
+                    "Remove the extra Sqlite entries from 'LogSinks'.");
 
             var secondaries = built
                 .Where(b => !ReferenceEquals(b.Sink, primaryPair.Sink))
@@ -119,7 +142,7 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton<ILogParser>(sp => new CompositeLogParser(
             sp.GetRequiredService<MikroTikSyslogParser>()
-        // sp.GetRequiredService<WinBeatLogParser>() ← and here
+            // sp.GetRequiredService<WinBeatLogParser>() ← and here
         ));
 
         // ── Owned ingress (P0.1 fix) ──────────────────────────────────────────

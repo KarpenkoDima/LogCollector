@@ -13,10 +13,25 @@ namespace LogCollector.Infrastructure.Parsers;
 ///   <30>Jun 18 20:50:28 MikroTikHome filter rule changed by admin
 ///
 /// Оба формата поддерживаются одним методом.
+///
+/// <para><b>Hardening (P1.4):</b> cheap structural checks reject malformed
+/// datagrams without turning the parser into a full RFC validator:</para>
+/// <list type="bullet">
+///   <item>PRI is all digits and Utf8Parser consumes every PRI byte;</item>
+///   <item>PRI is in the valid syslog range [0, 191];</item>
+///   <item>timestamp is exactly 15 bytes followed by a space separator;</item>
+///   <item>hostname is non-empty;</item>
+///   <item>the cursor never advances past the source buffer.</item>
+/// </list>
+/// <para>Unknown MikroTik topic/severity stay permissive (mapped to Unknown,
+/// never dropped). No regex, no string allocation on the hot path.</para>
 /// </summary>
 public static class SyslogParser
 {
     private const int TimestampByteLength = 15;
+
+    // Max valid syslog PRI: 23 (facility local7) * 8 + 7 (severity debug) = 191.
+    private const int MaxPriority = 191;
 
     public static bool TryParse(
         ReadOnlyMemory<byte> source,
@@ -29,47 +44,67 @@ public static class SyslogParser
         if (span.IsEmpty || span[0] != (byte)'<')
             return false;
 
-        int cursor = 0;
-
         // ── 1. PRI ────────────────────────────────────────────────────────────
         int angleClose = span.IndexOf((byte)'>');
-        if (angleClose <= 1)
+        if (angleClose <= 1)               // need at least one digit between < and >
             return false;
 
-        if (!Utf8Parser.TryParse(span[1..angleClose], out int priority, out _))
+        var priSpan = span[1..angleClose];
+
+        // P1.4: PRI must be all digits. Utf8Parser accepts a leading '+'/'-' sign,
+        // which is invalid for a syslog PRI — reject anything not starting with a
+        // digit before parsing. (Cheap: one byte check, no allocation.)
+        if (priSpan.IsEmpty || priSpan[0] is < (byte)'0' or > (byte)'9')
             return false;
 
-        cursor = angleClose + 1;
+        // Utf8Parser.TryParse stops at the first non-digit and reports bytesConsumed;
+        // if it consumed fewer bytes than priSpan.Length, there was garbage ('12x').
+        if (!Utf8Parser.TryParse(priSpan, out int priority, out int priConsumed))
+            return false;
+        if (priConsumed != priSpan.Length)
+            return false;
 
-        // ── 2. Timestamp — RFC 3164: всегда 15 байт ──────────────────────────
+        // P1.4: PRI in valid syslog range [0, 191].
+        if (priority is < 0 or > MaxPriority)
+            return false;
+
+        int cursor = angleClose + 1;
+
+        // ── 2. Timestamp — RFC 3164: ровно 15 байт + пробел-разделитель ──────
+        // Need 15 timestamp bytes AND the separator space after them.
         if (cursor + TimestampByteLength >= span.Length)
+            return false;
+
+        // P1.4: the byte right after the 15-byte timestamp must be a space.
+        if (span[cursor + TimestampByteLength] != (byte)' ')
             return false;
 
         var timestampMemory = source.Slice(cursor, TimestampByteLength);
         cursor += TimestampByteLength + 1;
 
-        // ── 3. Hostname — до первого пробела ─────────────────────────────────
+        // ── 3. Hostname — до первого пробела, НЕ пустой ──────────────────────
+        if (cursor >= span.Length)         // P1.4: cursor bound check
+            return false;
+
         int spaceAfterHost = span[cursor..].IndexOf((byte)' ');
-        if (spaceAfterHost < 0)
+        if (spaceAfterHost <= 0)           // P1.4: <0 not found, ==0 empty hostname
             return false;
 
         var hostnameMemory = source.Slice(cursor, spaceAfterHost);
         cursor += spaceAfterHost + 1;
 
         // ── 4. MikroTik-расширение: ": " после hostname ───────────────────────
-        // bsd-syslog=no:  "hostname : topic,severity message"
-        // bsd-syslog=yes: "hostname message"
         bool hasMikroTikTag = cursor + 1 < span.Length
                            && span[cursor]     == (byte)':'
                            && span[cursor + 1] == (byte)' ';
         if (hasMikroTikTag)
             cursor += 2;
 
-        // ── 5. Topic и Severity ───────────────────────────────────────────────
+        // ── 5. Topic и Severity (permissive — сохранено) ─────────────────────
         var topicMemory = ReadOnlyMemory<byte>.Empty;
         var severity    = PriToSeverity(priority & 7);
 
-        if (hasMikroTikTag)
+        if (hasMikroTikTag && cursor < span.Length)
         {
             int spaceAfterTag = span[cursor..].IndexOf((byte)' ');
             if (spaceAfterTag > 0)
@@ -86,6 +121,7 @@ public static class SyslogParser
         }
 
         // ── 6. Message ────────────────────────────────────────────────────────
+        // P1.4: cursor must not exceed source (defensive — all paths above respect it).
         if (cursor > source.Length)
             return false;
 
@@ -105,10 +141,6 @@ public static class SyslogParser
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// RFC 3164 numeric severity (PRI mod 8) → enum.
-    /// Используется для bsd-syslog=yes где текстового тега нет.
-    /// </summary>
     private static SyslogSeverity PriToSeverity(int s) => s switch
     {
         0 or 1 or 2 => SyslogSeverity.Critical,
@@ -119,7 +151,6 @@ public static class SyslogParser
         _            => SyslogSeverity.Unknown,
     };
 
-    /// <summary>Текстовый severity из MikroTik-тега. "info"u8 — compile-time литерал, ноль аллокаций.</summary>
     private static SyslogSeverity TextToSeverity(ReadOnlySpan<byte> s)
     {
         if (s.SequenceEqual("info"u8))     return SyslogSeverity.Info;

@@ -1,232 +1,477 @@
 # LogCollector
 
-A high-performance syslog ingestion service for .NET 9 that collects RFC 3164 messages from MikroTik routers and Windows machines and batch-writes them to a local SQLite database. The primary design constraint is zero heap allocation on the hot receive path at sustained rates of 10 000 entries per second.
+`LogCollector` — фоновый сервис на .NET 9 для приёма BSD Syslog от MikroTik по UDP, разбора сообщений без промежуточных строк и пакетной записи в локальную SQLite.
 
----
+SQLite является обязательным первичным хранилищем. После успешного сохранения batch может дополнительно отправляться в Loki или выводиться в консоль. Проект рассчитан на один экземпляр collector на одном хосте и небольшую внутреннюю сеть, включая текущий сценарий с одним MikroTik и дальнейшее подключение нескольких роутеров.
 
-## How data flows through the system
+> UDP не гарантирует доставку. Проект ограничивает потребление памяти и корректно управляет pooled-буферами, но не превращает UDP в надёжный транспорт.
 
-```
-MikroTik Router
-  │
-  │  UDP datagram  (<30>Jun  4 18:00:00 mtk-router : firewall,info forward: ...)
-  ▼
-UdpSyslogListener          ← BackgroundService, bound to UDP port 514
-  │
-  │  pinned receive buffer  (GC.AllocateArray, fixed in Pinned Object Heap)
-  │  ↓ one CopyTo per datagram
-  │  pool-rented buffer     (MemoryPool<byte>.Shared)
-  │
-  │  SyslogParser.TryParse  (zero allocation — IndexOf + span slices only)
-  │
-  │  LogEntry               (readonly struct, ~96 bytes on the stack)
-  ▼
-Channel<LogEntry>          ← BoundedChannel, capacity 10 000, FullMode.Wait
-  │
-  │  WaitToReadAsync  →  TryRead × N  (Cleary's batch-drain pattern)
-  ▼
-BatchWriterService         ← BackgroundService, one SQLite transaction per batch
-  │
-  │  Encoding.UTF8.GetString  ← strings allocated HERE, nowhere else
-  ▼
-SQLite (WAL mode)
-```
+## Что реализовано
 
-The two `BackgroundService` instances run on separate threads. The channel decouples their speeds: the listener can receive at network rate while the writer processes at its own pace. When the channel fills to capacity, `WriteAsync` suspends the listener — this is intentional backpressure that prevents unbounded memory growth during traffic spikes.
+- `UdpSyslogListener` принимает IPv4 UDP datagram через один долгоживущий pinned receive buffer;
+- после приёма выполняется одна копия datagram в буфер из `MemoryPool<byte>.Shared`, чтобы данные могли безопасно пережить следующий вызов `ReceiveFromAsync`;
+- `CompositeLogParser` делегирует разбор конкретным реализациям `ILogParser`;
+- `MikroTikSyslogParser` использует байтовый `SyslogParser` без regex, `Split`, `Substring` и промежуточных строк;
+- поддерживаются два фактических формата MikroTik:
+  - расширенный RouterOS: `hostname : topic,severity message`;
+  - обычный BSD Syslog/RFC 3164: `hostname message`;
+- `OwnedIngress` ограничивает очередь 10 000 элементами и реализует политику **freshest wins**: при заполнении вытесняется самая старая запись, а принадлежащий ей pooled-буфер освобождается;
+- `BatchWriterService` формирует окно batch до первого из событий: `BatchSize`, `BatchTimeout`, завершение channel или остановка приложения;
+- `FanOutLogRepository` сначала сохраняет batch в обязательный SQLite primary sink, затем запускает необязательные secondary sinks;
+- `SqliteLogSink` использует одну открытую connection, подготовленную команду и одну транзакцию на batch;
+- SQLite работает в `WAL` с `synchronous=NORMAL` и индексами по времени, hostname и severity;
+- `LokiLogSink` группирует записи по hostname, ограниченно повторяет transient HTTP failures и не отменяет уже успешную запись в SQLite;
+- Options проверяются при запуске через `ValidateOnStart`;
+- тесты покрывают парсер, владение буферами, overflow очереди, batching, shutdown drain, SQLite, fan-out и HTTP-поведение Loki;
+- присутствуют Docker-конфигурации для production, development и monitoring.
 
----
+## Архитектура и поток данных
 
-## Solution structure
-
-```
-LogCollector/
-├── LogCollector.Core/
-│   └── Domain/
-│       ├── LogEntry.cs          readonly struct — the unit of work through the pipeline
-│       └── SyslogSeverity.cs    enum (byte-backed) — debug / info / warning / error / critical
-│
-├── LogCollector.Infrastructure/
-│   ├── Parsers/
-│   │   └── SyslogParser.cs      zero-allocation RFC 3164 + MikroTik extension parser
-│   ├── Listeners/
-│   │   ├── UdpSyslogListener.cs BackgroundService — binds UDP socket, feeds Channel
-│   │   └── SyslogListenerOptions.cs
-│   ├── Pipeline/
-│   │   ├── BatchWriterService.cs BackgroundService — drains Channel, writes SQLite
-│   │   └── BatchWriterOptions.cs
-│   └── ServiceCollectionExtensions.cs   one-call DI registration for the whole layer
-│
-├── LogCollector.Host/
-│   ├── Program.cs               composition root — three lines of code
-│   ├── appsettings.json         production defaults
-│   ├── appsettings.Development.json
-│   └── logcollector.service     systemd unit file
-│
-└── LogCollector.Tests/
-    ├── Parsers/
-    │   └── SyslogParserTests.cs  unit tests + zero-copy architectural proof
-    └── Pipeline/
-        └── BatchWriterServiceTests.cs  integration tests against real in-memory SQLite
+```text
+MikroTik
+   │ UDP/IPv4 datagram
+   ▼
+UdpSyslogListener
+   │
+   ├─ один pinned byte[] для socket receive
+   ├─ одна CopyTo в MemoryPool<byte> buffer
+   ▼
+CompositeLogParser
+   ▼
+MikroTikSyslogParser → SyslogParser
+   │
+   │ LogEntry + ownership через RawBuffer
+   ▼
+OwnedIngress (capacity 10 000, explicit drop-oldest)
+   │
+   ▼
+BatchWriterService
+   │ batch по размеру или времени
+   ▼
+FanOutLogRepository
+   ├─ PRIMARY: SqliteLogSink ──► logs.db
+   ├─ SECONDARY: LokiLogSink ──► Loki ──► Grafana
+   └─ SECONDARY: ConsoleLogSink (Development)
 ```
 
-The dependency arrows point inward only: Host knows about Infrastructure and Core; Infrastructure knows about Core; Core knows nothing about the other layers. This is Clean Architecture's dependency rule enforced at the compiler level — if Infrastructure ever tried to reference Host, the build would fail.
+### Слои решения
 
----
+```text
+LogCollector.Core
+└── Domain
+    ├── LogEntry
+    └── SyslogSeverity
 
-## Getting started
+LogCollector.Application
+└── Interfaces
+    ├── ILogParser
+    ├── ILogRepository
+    └── ILogSink
 
-**Prerequisites:** .NET 9 SDK and a terminal.
+LogCollector.Infrastructure
+├── Listeners
+│   └── UdpSyslogListener
+├── Parsers
+│   ├── CompositeLogParser
+│   ├── MikroTikSyslogParser
+│   └── SyslogParser
+├── Pipeline
+│   ├── OwnedIngress
+│   └── BatchWriterService
+├── Sinks
+│   ├── FanOutLogRepository
+│   ├── SqliteLogSink
+│   ├── LokiLogSink
+│   └── sink factories
+└── ServiceCollectionExtensions
+
+LogCollector.Host
+├── Program.cs
+└── appsettings*.json
+
+LogCollector.Tests
+├── Configuration
+├── Parsers
+├── Pipeline
+└── Sinks
+```
+
+Направление зависимостей:
+
+```text
+Host ──► Infrastructure ──► Application ──► Core
+Host ─────────────────────────────────────► Core
+```
+
+`Core` не зависит от внешних пакетов. `Application` содержит контракты. Сетевой ввод, pipeline, SQLite, Loki и DI находятся в `Infrastructure`. `Host` является composition root.
+
+Подробное объяснение решений: [`DESIGN_GUIDE.md`](DESIGN_GUIDE.md).
+
+## Поддерживаемые сообщения
+
+### Расширенный формат MikroTik
+
+```text
+<30>Jun  4 18:00:00 edge-router : firewall,info forward: in:ether1 out:bridge
+```
+
+Из него извлекаются:
+
+- `Priority = 30`;
+- `TimestampRaw = "Jun  4 18:00:00"`;
+- `Hostname = "edge-router"`;
+- `Topic = "firewall"`;
+- `Severity = Info`;
+- `Message = "forward: in:ether1 out:bridge"`.
+
+### Обычный BSD Syslog/RFC 3164
+
+```text
+<30>Jun 18 20:50:28 edge-router filter rule changed by admin
+```
+
+В этом варианте `Topic` остаётся пустым, `Severity` определяется из PRI, а весь текст после hostname становится `Message`.
+
+Парсер выполняет дешёвые структурные проверки, но не является полным валидатором RFC 3164. Timestamp устройства сохраняется как исходные 15 байт: RFC 3164 не содержит года и timezone.
+
+## Быстрый локальный запуск
+
+### Требования
+
+- .NET 9 SDK;
+- опционально `sqlite3` для просмотра базы;
+- опционально `netcat` для отправки тестовой datagram из Linux.
+
+### Сборка и тесты
 
 ```bash
-# Clone and build
-git clone <repo-url>
-cd LogCollector
-dotnet build
-
-# Run all tests
-dotnet test
-
-# Start in development mode (listens on port 5140, writes to dev-logs.db)
-cd LogCollector.Host
-dotnet run
+dotnet restore
+dotnet build -c Release
+dotnet test -c Release
 ```
 
-Once the service is running, send a test datagram from a second terminal:
+### Запуск в Development
+
+Development-конфигурация слушает `5140/udp`, выводит разобранные записи в консоль и сохраняет их в `dev-logs.db`.
+
+Linux/macOS:
 
 ```bash
-echo "<30>Jun  4 18:00:00 mtk-router : firewall,info forward: in:ether1 out:bridge, proto TCP, 192.168.88.100:55000 -> 10.0.0.5:80" \
-  | nc -u -w1 localhost 5140
+DOTNET_ENVIRONMENT=Development \
+  dotnet run --project LogCollector.Host
 ```
 
-The entry should appear in `dev-logs.db` within one second (the development `BatchTimeout`). You can inspect it with any SQLite client:
+PowerShell:
+
+```powershell
+$env:DOTNET_ENVIRONMENT = "Development"
+dotnet run --project LogCollector.Host
+```
+
+### Тестовая отправка из Linux
 
 ```bash
-sqlite3 dev-logs.db "SELECT Hostname, Severity, Message FROM Logs ORDER BY Id DESC LIMIT 10;"
+printf '%s\n' '<30>Jun  4 18:00:00 edge-router : firewall,info local-test' \
+  | nc -u -w1 127.0.0.1 5140
 ```
 
----
+### Тестовая отправка из PowerShell
 
-## MikroTik configuration
-
-Point your router at the collector. Log in to the MikroTik CLI and run:
-
+```powershell
+$udp = [Net.Sockets.UdpClient]::new()
+$data = [Text.Encoding]::UTF8.GetBytes(
+    '<30>Jun  4 18:00:00 edge-router : firewall,info local-test')
+$udp.Send($data, $data.Length, '127.0.0.1', 5140)
+$udp.Dispose()
 ```
+
+### Проверка SQLite
+
+```bash
+sqlite3 dev-logs.db \
+  'SELECT Id, Hostname, Topic, Severity, Message, ReceivedAt FROM Logs ORDER BY Id DESC LIMIT 20;'
+```
+
+## Настройка MikroTik
+
+Пример RouterOS, где `192.168.88.10` — адрес хоста с collector:
+
+```routeros
 /system logging action
-set remote remote-address=<COLLECTOR_IP> remote-port=5140 src-address=0.0.0.0
+add name=logcollector \
+    target=remote \
+    remote=192.168.88.10 \
+    remote-port=514 \
+    bsd-syslog=no
 
 /system logging
-add action=remote topics=firewall
-add action=remote topics=dhcp
-add action=remote topics=system
+add action=logcollector topics=firewall
+add action=logcollector topics=system
+add action=logcollector topics=warning
 ```
 
-For production (port 514), change `remote-port=514`. Replace `5140` with whatever `SyslogListener.Port` is set to in your configuration.
+`bsd-syslog=no` рекомендуется для текущего парсера, потому что RouterOS добавляет `topic,severity`. При `bsd-syslog=yes` сообщение также принимается, но `Topic` будет пустым, а severity будет восстановлена из PRI.
 
----
+Если action уже существует, измените его через `set`, а не создавайте второй. На хосте должен быть разрешён входящий UDP-порт collector.
 
-## Configuration reference
+Не включайте без измерений логирование каждого проходящего firewall packet: даже один роутер способен создать поток, существенно превышающий обычные system/DHCP/warning события.
 
-All settings live in `appsettings.json` and can be overridden per-environment or via environment variables. The environment variable naming convention uses double underscore as the section separator: `"SyslogListener": { "Port": 514 }` becomes `SYSLOGLISTENER__PORT=514`.
+## Конфигурация
 
-**`SyslogListener` section**
+Generic Host читает конфигурацию из:
 
-`Port` (default `514`) is the UDP port to bind. Ports below 1024 require a capability on Linux — see the deployment section. `MaxDatagramSize` (default `8192`) controls the size of the single pinned receive buffer that lives for the entire service lifetime; it should be larger than the longest datagram you expect to receive.
+1. `appsettings.json`;
+2. `appsettings.{Environment}.json`;
+3. environment variables;
+4. аргументов командной строки.
 
-**`BatchWriter` section**
+Для environment variables вложенность задаётся двойным подчёркиванием, а элементы массива `LogSinks` — числовым индексом.
 
-`BatchSize` (default `500`) is the maximum number of entries written in a single SQLite transaction. Larger values improve throughput but increase per-batch latency. `BatchTimeout` (default `"00:00:02"`, format `HH:MM:SS`) is the maximum time to wait before flushing a partial batch — this keeps entries from stalling in the channel during low-traffic periods. `ConnectionString` (default `"Data Source=/var/log/logcollector/logs.db"`) is a standard SQLite connection string; the WAL journal mode and appropriate pragmas are set automatically at startup.
+### `SyslogListener`
 
----
+| Параметр | Значение по умолчанию | Допустимый диапазон | Назначение |
+|---|---:|---:|---|
+| `Port` | `514` | `1..65535` | UDP-порт процесса |
+| `MaxDatagramSize` | `8192` | `256..65507` | размер единственного pinned receive buffer |
 
-## Production deployment
-
-**Build a self-contained binary:**
+Пример:
 
 ```bash
-dotnet publish LogCollector.Host -c Release -r linux-x64 --self-contained true -o /opt/logcollector
+SyslogListener__Port=5140
+SyslogListener__MaxDatagramSize=8192
 ```
 
-**Create the service account and log directory:**
+### `BatchWriter`
+
+| Параметр | Значение по умолчанию | Допустимый диапазон | Назначение |
+|---|---:|---:|---|
+| `BatchSize` | `500` | `1..10000` | максимум записей в одной транзакции |
+| `BatchTimeout` | `00:00:02` | `> 0`, не более 30 секунд | максимальная длительность неполного batch-window |
+
+### `LogSinks`
+
+Требуется **ровно один** sink с `Type = Sqlite`. Он становится primary и является источником истины.
+
+```json
+{
+  "LogSinks": [
+    {
+      "Type": "Sqlite",
+      "ConnectionString": "Data Source=logs.db"
+    }
+  ]
+}
+```
+
+Допустимые типы текущей версии:
+
+| Type | Роль | Параметры |
+|---|---|---|
+| `Sqlite` | обязательный primary | `ConnectionString` |
+| `Loki` | optional secondary | `Endpoint`, optional `Labels` |
+| `Console` | optional secondary для разработки | без обязательных параметров |
+
+Пример SQLite + Loki:
+
+```json
+{
+  "LogSinks": [
+    {
+      "Type": "Sqlite",
+      "ConnectionString": "Data Source=logs.db"
+    },
+    {
+      "Type": "Loki",
+      "Endpoint": "http://loki:3100",
+      "Labels": {
+        "app": "logcollector",
+        "environment": "production"
+      }
+    }
+  ]
+}
+```
+
+Эквивалентные environment variables:
+
+```dotenv
+LogSinks__0__Type=Sqlite
+LogSinks__0__ConnectionString=Data Source=/app/data/logs.db
+LogSinks__1__Type=Loki
+LogSinks__1__Endpoint=http://loki:3100
+LogSinks__1__Labels__app=logcollector
+```
+
+## Поведение очереди при нагрузке
+
+Внутренняя capacity сейчас жёстко задана в DI:
+
+```text
+10 000 LogEntry
+```
+
+Когда очередь заполнена, `OwnedIngress`:
+
+1. извлекает самую старую запись;
+2. вызывает `RawBuffer.Dispose()` ровно один раз;
+3. увеличивает `DroppedCount`;
+4. помещает новую запись.
+
+Это политика **freshest wins**. Listener не ждёт освобождения места и продолжает принимать новые datagram, пока успевает socket и процесс.
+
+Следствия:
+
+- память очереди ограничена;
+- старые сообщения могут быть потеряны при длительной перегрузке;
+- UDP сам по себе тоже может потерять datagram до попадания в приложение;
+- `DroppedCount` пока не опубликован как metric или health signal.
+
+## Batching и запись
+
+Batch-window открывается после получения первой записи и закрывается при первом условии:
+
+1. накоплено `BatchWriter.BatchSize` элементов;
+2. истёк `BatchWriter.BatchTimeout`;
+3. producer завершил channel;
+4. началась остановка приложения.
+
+SQLite primary записывает batch в одной транзакции. После успешного commit вторичные sinks запускаются параллельно с общим budget 5 секунд.
+
+### Важная семантика ошибок
+
+- ошибка SQLite считается ошибкой primary;
+- `FanOutLogRepository` пробрасывает её в `BatchWriterService`;
+- `BatchWriterService` логирует ошибку и освобождает все буферы batch;
+- **автоматического retry SQLite в текущей версии нет, такой batch теряется**;
+- ошибка, timeout или недоступность Loki не отменяет уже успешный SQLite commit;
+- пропущенные Loki batch автоматически не воспроизводятся после восстановления Loki.
+
+## SQLite schema
+
+Текущая таблица:
+
+```sql
+CREATE TABLE Logs (
+    Id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    Priority     INTEGER NOT NULL,
+    TimestampRaw TEXT    NOT NULL,
+    Hostname     TEXT    NOT NULL,
+    Topic        TEXT    NOT NULL,
+    Severity     INTEGER NOT NULL,
+    Message      TEXT    NOT NULL,
+    ReceivedAt   INTEGER NOT NULL
+);
+```
+
+`ReceivedAt` хранится как Unix milliseconds UTC. Создаются индексы:
+
+```text
+idx_logs_received_at
+idx_logs_hostname
+idx_logs_severity
+```
+
+Строки создаются только на границе SQLite/Loki/Console. До этого поля `LogEntry` являются `ReadOnlyMemory<byte>` slices одного rented buffer.
+
+## Docker
+
+Docker-файлы соответствуют текущим секциям `SyslogListener`, `BatchWriter` и `LogSinks`.
+
+- `docker-compose.yml` — production: один collector + SQLite;
+- `docker-compose.dev.yml` — самостоятельный SDK-container с `dotnet watch`;
+- `docker-compose.monitoring.yml` — override, добавляющий Loki и Grafana к тому же collector.
+
+Подробные команды, security-настройки и backup: [`DOCKER.md`](DOCKER.md).
+
+### Production
 
 ```bash
-sudo useradd -r -s /sbin/nologin logcollector
-sudo mkdir -p /var/log/logcollector
-sudo chown logcollector:logcollector /var/log/logcollector
+cp .env.example .env
+docker compose build --pull logcollector
+docker compose up -d
+docker compose logs -f logcollector
 ```
 
-**Grant the binary permission to bind port 514 without running as root:**
+Поток портов:
+
+```text
+MikroTik → host 514/udp → Docker NAT → container 5140/udp
+```
+
+### Development
 
 ```bash
-sudo setcap cap_net_bind_service+ep /opt/logcollector/LogCollector.Host
+mkdir -p data
+docker compose -f docker-compose.dev.yml up --build
 ```
 
-This grants a single, specific Linux capability to the file. The process still runs as the unprivileged `logcollector` user — `setcap` only allows it to bind privileged ports. The systemd unit file (`logcollector.service`) reinforces this with `AmbientCapabilities=CAP_NET_BIND_SERVICE` so the capability is inherited correctly.
+Listener доступен на `127.0.0.1:5140/udp`, база находится в `./data/dev-logs.db`.
 
-If you prefer not to use capabilities, set `Port` to `5140` and add a kernel-level redirect instead:
+### Monitoring
 
 ```bash
-sudo iptables -t nat -A PREROUTING -p udp --dport 514 -j REDIRECT --to-port 5140
+mkdir -p secrets
+openssl rand -base64 36 > secrets/grafana_admin_password.txt
+chmod 600 secrets/grafana_admin_password.txt
+
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.monitoring.yml \
+  up -d --build
 ```
 
-**Install and start the systemd service:**
+Grafana по умолчанию доступна на `http://127.0.0.1:3000`. Loki не публикуется на host. Dashboard использует Loki labels `app` и `hostname`.
+
+## Тестирование
 
 ```bash
-sudo cp /opt/logcollector/logcollector.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now logcollector
-sudo systemctl status logcollector
+dotnet test -c Release --logger "console;verbosity=normal"
 ```
 
-**Follow logs:**
+Тестовый проект проверяет:
 
-```bash
-journalctl -u logcollector -f
-```
+- корректное извлечение полей и zero-copy slices;
+- PRI, обрезанные datagram, пустой hostname и неизвестные topic/severity;
+- validation границ Options;
+- flush по timeout и размеру;
+- последовательности batch `[8, 8, 4]`;
+- освобождение `RawBuffer` после успеха и ошибки;
+- explicit drop-oldest без утечки owner;
+- drain хвоста при штатной остановке;
+- SQLite round-trip всех полей;
+- primary/secondary semantics fan-out;
+- Loki 2xx, 4xx, 5xx retry, response disposal и cancellation.
 
-Because `Program.cs` calls `builder.Services.AddSystemd()`, the service sends `sd_notify("READY=1")` once the UDP socket is bound and the SQLite schema is verified. The unit file uses `Type=notify`, so `systemctl start` blocks until that signal arrives — you will never see the service reported as "active" before it is genuinely ready to receive datagrams.
+## Гарантии и ограничения текущей версии
 
----
+### Что гарантируется внутри процесса
 
-## Design decisions
+- bounded очередь не растёт бесконечно;
+- вытеснённый pooled-буфер освобождается;
+- принятый в batch буфер освобождается после попытки сохранения;
+- успешный SQLite commit не отменяется ошибкой secondary sink;
+- конфигурация основных Options проверяется при запуске.
 
-Three architectural rules shaped every file in this codebase. They are worth understanding because they explain choices that might otherwise look unusual.
+### Что не гарантируется
 
-### Zero allocation on the hot path (Kokosa's rule)
+- доставка UDP datagram;
+- отсутствие потерь при переполнении ingress;
+- retry или durable replay при ошибке SQLite;
+- replay пропущенных Loki batch;
+- сохранение IP-адреса UDP-отправителя — в базе хранится только hostname из сообщения;
+- RFC 5424 и TCP syslog;
+- retention/автоматическая очистка SQLite;
+- горизонтальное масштабирование нескольких writer над одной SQLite;
+- настоящий readiness endpoint.
 
-At 10 000 datagrams per second, even a single `new byte[]` inside the receive loop produces 10 000 Gen0 objects per second. The .NET GC handles Gen0 very efficiently, but at that rate it adds measurable "stop the world" pauses every few hundred milliseconds — unacceptable for a latency-sensitive collector.
+## Текущий scope дальнейшего развития
 
-The solution is a two-buffer design. A single `byte[]` allocated with `GC.AllocateArray<byte>(size, pinned: true)` lives in the Pinned Object Heap for the entire service lifetime and receives every datagram. After each receive, the datagram bytes are copied into a segment rented from `MemoryPool<byte>.Shared` (backed by `ArrayPool<byte>`) — this is the one allocation per datagram that cannot be avoided, because `LogEntry` needs a stable memory region to point at while it travels through the channel.
+До расширения с одного до нескольких MikroTik наиболее полезны:
 
-`SyslogParser` then operates entirely on `ReadOnlySpan<byte>` using `IndexOf` and range slices. No `string.Split`, no `Substring`, no intermediate strings. The zero-copy guarantee is formally verified by a unit test that uses `MemoryMarshal.TryGetArray` to confirm that every `ReadOnlyMemory<byte>` field in the parsed `LogEntry` shares the exact same backing array — and the exact same byte offset — as the original source buffer.
-
-Strings are created in exactly one place: `BatchWriterService.WriteBatchAsync`, in the call to `Encoding.UTF8.GetString(span)` immediately before each `SqliteParameter` is assigned. They live briefly, get serialized into the SQLite wire protocol, and become Gen0 garbage. Because they are short-lived and collected in bulk during the next Gen0 sweep, their allocation cost is negligible.
-
-### Bounded channel with backpressure (Cleary's rule)
-
-The channel between the listener and the writer is deliberately bounded at 10 000 entries — roughly one second of traffic at peak rate. When it fills, `ChannelWriter.WriteAsync` suspends the listener rather than dropping datagrams or growing unboundedly.
-
-This is backpressure, not data loss. While the listener is suspended, the OS-level socket receive buffer absorbs incoming datagrams. The router eventually notices they are not being acknowledged and slows down. The system as a whole degrades gracefully under load rather than consuming unbounded memory and crashing.
-
-The batch-drain pattern — `WaitToReadAsync` followed by `TryRead` in a tight loop — is the idiomatic way to consume a channel in bulk. `WaitToReadAsync` parks the consumer thread cheaply while the channel is empty. Once data arrives, `TryRead` pulls entries synchronously without returning to the scheduler, which is what produces actual batching behaviour. A 500-entry batch means one SQLite `COMMIT` instead of 500, which on a typical SSD is the difference between 500 ms/s of `fsync` time and 1 ms/s.
-
-### `readonly struct` for `LogEntry` (Richter's rule)
-
-`LogEntry` is a value type. When the listener calls `await _writer.WriteAsync(entry, ct)`, the struct is copied into the channel's internal ring-buffer array. When the writer calls `_reader.TryRead(out var entry)`, it is copied back out. Both copies are stack-to-array or array-to-stack `memcpy` operations — fast, predictable, and invisible to the GC.
-
-The alternative — a `record class` or any reference type — would allocate a new heap object for every log entry. 10 000 heap objects per second all in Gen0, all collected every few hundred milliseconds. The `readonly struct` makes the GC irrelevant to the hot path entirely.
-
-The struct carries one managed reference: `IMemoryOwner<byte>? RawBuffer`. This is the ownership handle for the pool-rented buffer. The GC does track this reference, but it tracks one `IMemoryOwner<byte>` per entry rather than one `LogEntry` object per entry — the tracking cost is the same, but the allocation cost of the `LogEntry` itself disappears.
-
----
-
-## Testing
-
-```bash
-dotnet test --logger "console;verbosity=detailed"
-```
-
-The test suite contains 19 tests across two classes.
-
-`SyslogParserTests` covers every field extraction, all five severity levels, RFC 3164 edge cases (single-digit day padding, trailing CR/LF), and malformed input. The most structurally interesting test is `TryParse_AllMemoryFields_AreSlicesOfSourceBuffer_NoBytesAreCopied`, which uses `MemoryMarshal.TryGetArray` to open up the parsed `LogEntry` and verify — at the byte level — that each field points into the original source array with the correct offset and length.
-
-`BatchWriterServiceTests` runs against a real SQLite database using the named shared-memory mode (`Mode=Memory;Cache=Shared`). A "guardian connection" kept open for the duration of each test prevents SQLite from discarding the in-memory database between the batch writer's per-batch connections. The tests cover the timer flush path (sparse traffic), the batch-full path (burst traffic), graceful shutdown drain, and — critically — that `RawBuffer.Dispose()` is called regardless of whether the SQLite write succeeded or threw an exception.
+1. сохранение source IP;
+2. метрики received/parsed/dropped/channel depth/SQLite latency;
+3. configurable retention SQLite;
+4. retry policy для transient SQLite errors;
+5. отделение Loki от основного writer отдельной очередью;
+6. нагрузочный тест на реальных сообщениях RouterOS;
+7. backup/restore test.

@@ -1,26 +1,76 @@
-# Development override — use with:
-#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+name: logcollector-dev
+
+# Самостоятельный development Compose, а не override production-файла.
+# Так dev-запуск не наследует production port, volume и read_only-настройки.
 #
-# Changes from production:
-#   - Builds from source instead of a pre-built image
-#   - Exposes port 5140 directly (no 514 mapping — avoids root on dev machines)
-#   - SQLite written to ./data/ for easy inspection with any SQLite browser
-#   - Verbose logging
-#   - Console sink enabled alongside SQLite
+# Запуск:
+#   mkdir -p data
+#   docker compose -f docker-compose.dev.yml up --build
 
 services:
   logcollector:
+    image: ${LOGCOLLECTOR_DEV_IMAGE:-logcollector:dev}
     build:
       context: .
       dockerfile: Dockerfile
-      target: build         # stop at the build stage for faster iteration
+      target: development
+
+    init: true
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+
     ports:
-      - "5140:5140/udp"     # direct access on unprivileged port
-    volumes:
-      - ./data:/var/log/logcollector   # bind mount — inspect DB with sqlitebrowser
+      # Dev listener доступен только на Docker host.
+      - "127.0.0.1:${SYSLOG_DEV_HOST_PORT:-5140}:5140/udp"
+
     environment:
       DOTNET_ENVIRONMENT: Development
-      SYSLOGLISTENER__PORT: "5140"
-      LOGSINKS__0__TYPE: "Console"
-      LOGSINKS__1__TYPE: "Sqlite"
-      LOGSINKS__1__CONNECTIONSTRING: "Data Source=/var/log/logcollector/dev-logs.db"
+      DOTNET_EnableDiagnostics: "1"
+      DOTNET_USE_POLLING_FILE_WATCHER: "true"
+
+      SyslogListener__Port: "5140"
+      SyslogListener__MaxDatagramSize: "8192"
+
+      # appsettings.Development.json содержит Console + SQLite.
+      # Переопределяем только путь SQLite внутри контейнера.
+      LogSinks__1__ConnectionString: >-
+        Data Source=/app/data/dev-logs.db;Cache=Shared
+
+      # dotnet CLI должен писать служебные файлы в доступный каталог.
+      HOME: /tmp
+      DOTNET_CLI_HOME: /tmp/dotnet-cli
+
+    # На Linux заполните LOCAL_UID/LOCAL_GID командой `id -u` / `id -g`.
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+
+    volumes:
+      - type: bind
+        source: .
+        target: /src
+      - type: bind
+        source: ./data
+        target: /app/data
+
+    tmpfs:
+      - /tmp:rw,nosuid,size=128m,mode=1777
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: ${LOGCOLLECTOR_DEV_MEMORY_LIMIT:-1g}
+
+    networks:
+      - logcollector-dev-net
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+networks:
+  logcollector-dev-net:
+    name: ${LOGCOLLECTOR_DEV_NETWORK:-logcollector-dev-net}
+    driver: bridge

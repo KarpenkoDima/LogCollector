@@ -1,567 +1,757 @@
-# Проектирование высоконагруженных приложений на .NET 9
+# Почему LogCollector устроен именно так
 
-## Практическое руководство на примере LogCollector
+Этот документ объясняет не абстрактный «идеальный syslog collector», а фактическую реализацию текущего репозитория:
+
+```text
+UdpSyslogListener
+    → CompositeLogParser / MikroTikSyslogParser / SyslogParser
+    → OwnedIngress
+    → BatchWriterService
+    → FanOutLogRepository
+        → SqliteLogSink (primary)
+        → LokiLogSink / ConsoleLogSink (secondary)
+```
+
+Главные ограничения задачи:
+
+- источник отправляет UDP, поэтому абсолютной гарантии доставки нет;
+- приложение должно ограничивать память при burst-нагрузке;
+- байты сообщения нужны дольше одного socket receive;
+- SQLite должна оставаться источником истины;
+- Loki не должен превращать успешный SQLite commit в ошибку batch;
+- каждый pool-rented buffer должен иметь одного понятного владельца и освобождаться ровно один раз.
 
 ---
 
-> Эта книга о том, как думать о производительности *до* написания кода. Не об оптимизации — о проектировании. Разница принципиальна: оптимизация исправляет уже написанный медленный код, а правильное проектирование не даёт этому коду появиться.
+## 1. Слои и зависимости
+
+### `LogCollector.Core`
+
+Содержит доменные типы:
+
+- `LogEntry`;
+- `SyslogSeverity`.
+
+Проект не зависит от Infrastructure, SQLite, HTTP или Generic Host.
+
+### `LogCollector.Application`
+
+Содержит контракты:
+
+- `ILogParser` — разбор datagram;
+- `ILogRepository` — инициализация и сохранение batch;
+- `ILogSink` — отдельное назначение логов.
+
+Application зависит только от Core.
+
+### `LogCollector.Infrastructure`
+
+Содержит техническую реализацию:
+
+- UDP socket;
+- parsers;
+- bounded ingress;
+- batch orchestration;
+- SQLite;
+- Loki;
+- Console sink;
+- Options validation;
+- DI registration.
+
+### `LogCollector.Host`
+
+`Program.cs` является composition root. Он создаёт Generic Host, включает systemd integration и вызывает `AddLogCollectorInfrastructure`.
+
+Зависимости направлены внутрь:
+
+```text
+Host → Infrastructure → Application → Core
+```
+
+Это не означает, что каждый класс обязан называться «UseCase» или «Repository». Главное архитектурное свойство здесь — доменные типы и контракты не зависят от конкретных способов ввода и хранения.
 
 ---
 
-## Перед тем как начать
+## 2. Полный жизненный цикл одной datagram
 
-На протяжении всего руководства мы будем строить LogCollector — сервис, который принимает UDP-дейтаграммы от MikroTik-роутеров, парсит их формат syslog и записывает в SQLite. Целевая нагрузка: **10 000 сообщений в секунду** при нулевом давлении на сборщик мусора на горячем пути.
+Рассмотрим сообщение:
 
-Это звучит как «преждевременная оптимизация». Это не так. При 10 000 объектов в секунду в Gen0 сборщик мусора .NET запускается несколько сотен раз в минуту. Каждый запуск — остановка всех потоков приложения на 0.5–5 мс. На практике это значит: UDP-сокет перестаёт вычитывать данные, роутер видит, что получатель не успевает, и начинает дропать пакеты. Вы теряете логи, и именно в момент инцидента — потому что именно тогда нагрузка максимальна.
+```text
+<30>Jun  4 18:00:00 edge-router : firewall,info accepted connection
+```
 
-Проектирование «под нагрузку с самого начала» не делает код сложнее. Оно делает его иначе устроенным. Вот об этом книга.
+Оно проходит следующие этапы.
+
+### Шаг 1. Socket получает байты в pinned buffer
+
+`UdpSyslogListener` один раз создаёт:
+
+```csharp
+GC.AllocateArray<byte>(maxDatagramSize, pinned: true)
+```
+
+Этот массив живёт столько же, сколько listener. Его адрес не перемещается GC, поэтому он подходит как стабильное место приёма данных из socket.
+
+Следующий `ReceiveFromAsync` перезапишет тот же массив. Поэтому передавать slices этого массива в asynchronous pipeline нельзя.
+
+### Шаг 2. Datagram копируется в rented buffer
+
+После получения длины listener вызывает:
+
+```csharp
+MemoryPool<byte>.Shared.Rent(length)
+```
+
+и выполняет одну копию:
+
+```text
+pinned receive buffer → rented datagram buffer
+```
+
+Эта копия необходима для текущей архитектуры: запись может находиться в ingress и batch дольше, чем длится следующий socket receive.
+
+Следовательно, точная формулировка производительности:
+
+- socket receive buffer переиспользуется;
+- parser не копирует отдельные поля;
+- на datagram выполняется одна копия в буфер с независимым временем жизни;
+- весь процесс не является «абсолютно zero-allocation».
+
+### Шаг 3. Parser создаёт slices
+
+`SyslogParser` работает с:
+
+```csharp
+ReadOnlyMemory<byte>
+ReadOnlySpan<byte>
+```
+
+Поля `TimestampRaw`, `Hostname`, `Topic` и `Message` не получают собственные массивы. Они являются диапазонами одного datagram buffer.
+
+### Шаг 4. Ownership прикрепляется к `LogEntry`
+
+После успешного parse listener создаёт копию struct:
+
+```csharp
+entry = entry with { RawBuffer = datagramOwner };
+```
+
+С этого момента `RawBuffer` представляет владение памятью всех byte-slices записи.
+
+### Шаг 5. `OwnedIngress` принимает или вытесняет запись
+
+Новая запись помещается в bounded channel. Если очередь заполнена, самая старая запись извлекается, её `RawBuffer` освобождается, а новая запись занимает освободившееся место.
+
+### Шаг 6. `BatchWriterService` собирает batch
+
+Consumer читает `LogEntry` из channel и держит их в `List<LogEntry>` до flush по размеру, времени, completion или shutdown.
+
+### Шаг 7. SQLite создаёт строки
+
+Только `SqliteLogSink` преобразует byte fields в `string`:
+
+```csharp
+Encoding.UTF8.GetString(entry.Hostname.Span)
+```
+
+Это неизбежная граница текущей схемы, поскольку SQLite columns имеют тип `TEXT`.
+
+### Шаг 8. Буфер возвращается в pool
+
+`BatchWriterService.SaveAndDisposeAsync` освобождает `RawBuffer` в `finally` независимо от результата repository write.
 
 ---
 
-## Глава 1. Враг номер один: давление на сборщик мусора
+## 3. Почему одновременно используются `ReadOnlySpan<byte>` и `ReadOnlyMemory<byte>`
 
-### 1.1 Как работает GC в .NET
+### `ReadOnlySpan<byte>`
 
-Сборщик мусора .NET разделяет все объекты на три поколения. Объект создаётся в **Gen0** — самой маленькой и быстрой «корзине». Если он переживает сборку Gen0, переходит в **Gen1**, а затем в **Gen2**. Сборка Gen0 занимает доли миллисекунды и происходит часто. Сборка Gen2 — дорогостоящая, затрагивает всю кучу и может занять десятки миллисекунд.
+Span удобен для синхронного разбора:
 
-```
-  Объект создан
-       │
-       ▼
-    [Gen0]  ← быстрая сборка, часто
-       │ выжил
-       ▼
-    [Gen1]  ← промежуточная
-       │ выжил снова
-       ▼
-    [Gen2]  ← полная сборка, дорого
-```
+- дешёвые slices;
+- `IndexOf`;
+- `SequenceEqual`;
+- нет копирования;
+- нельзя сохранить в обычном объекте или struct, который переживает текущий stack frame;
+- нельзя переносить через `await`.
 
-Ключевое свойство GC: во время сборки **все потоки приложения останавливаются** (stop-the-world). Пока GC работает, ваш UDP-слушатель не читает сокет. Роутер ждёт. Если ждёт слишком долго — дропает пакет.
+Поэтому parser использует Span локально.
 
-### 1.2 Что происходит при 10 000 логов в секунду
+### `ReadOnlyMemory<byte>`
 
-Представим наивную реализацию:
+Memory можно хранить в `LogEntry` и передавать через channel. Она содержит ссылку на backing memory, offset и length.
+
+Важно: `ReadOnlyMemory<byte>` не владеет памятью. Она только указывает на неё. Владение обеспечивается отдельным `IMemoryOwner<byte> RawBuffer`.
+
+### Почему нельзя сразу вызвать `Dispose`
+
+После:
 
 ```csharp
-// ❌ Наивный подход — каждая дейтаграмма создаёт объект в куче
-public class LogEntry          // class, не struct
-{
-    public string Hostname { get; set; }
-    public string Message  { get; set; }
-    public DateTime ReceivedAt { get; set; }
-}
-
-// В слушателе:
-var entry = new LogEntry      // Gen0 allocation
-{
-    Hostname   = line.Split(' ')[4],   // ещё одна allocation для string[]
-    Message    = line.Substring(45),   // ещё одна allocation для string
-    ReceivedAt = DateTime.UtcNow
-};
+var entry = Parse(owner.Memory);
 ```
 
-При 10 000 сообщений в секунду только создание `LogEntry` как `class` порождает **10 000 объектов в Gen0 каждую секунду**. Плюс промежуточные строки от `Split` и `Substring`. Реально — 40 000–60 000 объектов в секунду. Gen0 будет собираться несколько раз в секунду, Gen1 — несколько раз в минуту.
+нельзя вернуть `owner` в pool, пока запись находится в очереди. Следующий арендатор сможет перезаписать массив, а `Hostname`, `Topic` и `Message` начнут указывать на чужие данные.
 
-> **Примечание.** Профилировщики производительности .NET (dotMemory, PerfView, dotnet-trace) позволяют увидеть частоту GC-коллекций в реальном времени. На нагруженном сервисе с наивной реализацией вы увидите Gen0 каждые 200–500 мс — это означает до пяти stop-the-world пауз в секунду.
-
-### 1.3 Правило горячего пути
-
-Из наблюдений выше следует первый принцип проектирования:
-
-> **Правило 1.** На горячем сетевом пути запрещено создавать объекты в куче. Всё, что выполняется для каждого входящего сообщения, должно работать только с уже выделенной памятью.
-
-«Горячий путь» в LogCollector — это: получение дейтаграммы → парсинг → запись в Channel. Всё это должно выполняться без единого `new` и без создания строк.
+Поэтому ownership путешествует вместе с entry до последнего consumer.
 
 ---
 
-## Глава 2. Нулевая аллокация: `Span<T>` и `Memory<T>`
+## 4. `LogEntry` как `readonly struct`
 
-### 2.1 Что такое Span
+`LogEntry` содержит:
 
-`ReadOnlySpan<byte>` — это **стековая структура**, которая описывает непрерывный участок памяти тремя полями: указатель, смещение, длина. Она не владеет памятью — только указывает на неё. Создание Span из существующего массива не выделяет никакой памяти:
+- числовые значения;
+- четыре `ReadOnlyMemory<byte>` slices;
+- `DateTimeOffset`;
+- ссылку на `IMemoryOwner<byte>`.
+
+`readonly struct` уменьшает необходимость создавать отдельный объект `LogEntry` на heap для каждого сообщения. Channel хранит значения inline во внутреннем буфере.
+
+При этом важно не переоценивать результат:
+
+- `IMemoryOwner<byte>` является managed reference;
+- реализация `MemoryPool` может создавать небольшой ownership object;
+- `List<LogEntry>` выделяет массив для batch;
+- SQLite/Loki/Console создают строки;
+- JSON payload Loki создаёт объекты и строки.
+
+Верное обещание проекта — **zero-copy field extraction на parser hot path**, а не zero-allocation всего приложения.
+
+---
+
+## 5. Почему listener использует два буфера
+
+Один pinned receive buffer минимизирует долгоживущие pinned allocations. Если арендовать и pin-ить новый массив на каждую datagram, GC и pinned memory fragmentation получили бы лишнюю нагрузку.
+
+Но одного массива недостаточно, потому что pipeline асинхронный:
+
+```text
+receive N
+receive N+1
+receive N+2
+```
+
+выполняются быстрее, чем SQLite обязательно сохранит `N`.
+
+Поэтому выбрана схема:
+
+```text
+один pinned receive buffer
+          ↓ одна копия
+отдельный rented buffer на принятую запись
+          ↓
+очередь и batch
+```
+
+Listener также переиспользует один `SocketAddress` для IPv4 overload `ReceiveFromAsync`, чтобы не создавать новый endpoint object на каждую datagram.
+
+### Что listener пока не делает
+
+- не сохраняет IP-адрес sender в `LogEntry`;
+- не слушает IPv6: socket создаётся с `AddressFamily.InterNetwork`;
+- не принимает TCP syslog;
+- не публикует метрики socket errors или parse failures.
+
+---
+
+## 6. Parser: permissive, но с дешёвым hardening
+
+### Поддерживаемые варианты
+
+#### MikroTik extended
+
+```text
+<30>Jun  4 18:00:00 edge-router : firewall,info message
+```
+
+Parser извлекает topic и текстовую severity.
+
+#### BSD Syslog/RFC 3164
+
+```text
+<30>Jun 18 20:50:28 edge-router message
+```
+
+Topic остаётся пустым, severity вычисляется из младших трёх бит PRI.
+
+### Проверки
+
+`SyslogParser` проверяет:
+
+- первый байт `<`;
+- наличие `>`;
+- PRI состоит только из цифр;
+- `Utf8Parser` употребил весь PRI segment;
+- PRI находится в диапазоне `0..191`;
+- timestamp занимает ровно 15 байт и за ним есть пробел;
+- hostname не пуст;
+- cursor не выходит за source;
+- trailing CR/LF удаляются из message.
+
+### Почему parser не является полным RFC validator
+
+Полная проверка месяца, дня, времени, допустимого hostname и всех вариантов RFC усложнила бы hot path. Текущая задача — безопасно выделить поля из ожидаемых RouterOS сообщений и не упасть на повреждённой datagram.
+
+Неизвестный topic принимается. Неизвестная текстовая severity становится `SyslogSeverity.Unknown`, но запись не отбрасывается.
+
+### `CompositeLogParser`
+
+Listener зависит от `ILogParser`, а не от конкретного `SyslogParser`. Сейчас composite содержит только `MikroTikSyslogParser`, но позволяет добавить новый формат без изменения network listener.
+
+Порядок parsers важен: более специфичные форматы должны идти раньше более permissive.
+
+---
+
+## 7. Почему обычный `BoundedChannelFullMode.DropOldest` не подходит
+
+`LogEntry` владеет `RawBuffer`. Если встроенный channel самостоятельно удалит старый item, приложение не получит возможности вызвать:
 
 ```csharp
-byte[] buffer = new byte[8192];           // одна аллокация, один раз
-ReadOnlySpan<byte> span = buffer;         // нет аллокации — только view
-ReadOnlySpan<byte> slice = span[4..19];   // нет аллокации — только другой view
+evicted.RawBuffer?.Dispose();
 ```
 
-Именно поэтому `Span<T>` — основа zero-allocation парсинга. Весь парсер `SyslogParser` в нашем проекте работает исключительно со span-срезами одного уже существующего буфера.
+Это приведёт к утечке rented buffers при длительной перегрузке.
 
-### 2.2 Запрещённые паттерны
-
-Следующие операции **всегда создают новые объекты в куче** и запрещены на горячем пути:
+Поэтому `OwnedIngress` создаёт внутренний channel в режиме:
 
 ```csharp
-// ❌ string.Split — создаёт массив строк
-string[] parts = line.Split(' ');
-
-// ❌ Substring — создаёт новую строку
-string hostname = line.Substring(4, 10);
-
-// ❌ new byte[] — создаёт новый массив
-byte[] temp = new byte[datagramSize];
-
-// ❌ string.Format и интерполяция строк
-string msg = $"host={hostname}, len={length}";
+FullMode = BoundedChannelFullMode.Wait
 ```
 
-### 2.3 Разрешённые паттерны
+но сам listener никогда не вызывает `WriteAsync`. Вместо этого `TryEnqueue` вручную реализует:
+
+```text
+TryWrite(new)
+    ├─ success → accepted
+    └─ full
+        → TryRead(oldest)
+        → Dispose(oldest.RawBuffer)
+        → increment DroppedCount
+        → TryWrite(new)
+```
+
+### Почему нужен `lock`
+
+Проверка заполнения, вытеснение и вставка должны быть одной атомарной последовательностью. Без lock два producer могли бы одновременно извлечь разные элементы или потерять ownership новой записи.
+
+### Почему `SingleReader = false`
+
+Channel читают два пути:
+
+1. штатный `BatchWriterService`;
+2. eviction-path внутри `OwnedIngress.TryEnqueue`.
+
+Поэтому заявлять одного reader нельзя.
+
+### Почему `SingleWriter = false`
+
+Запись и completion потенциально вызываются из разных execution paths. Реализация не даёт channel оптимизацию single-writer.
+
+### Семантика `freshest wins`
+
+Это не backpressure. При заполнении ingress producer не ждёт consumer, а удаляет старейшую запись.
+
+Плюсы:
+
+- memory bound;
+- listener продолжает принимать свежие события;
+- владелец вытеснённой памяти освобождается корректно.
+
+Минусы:
+
+- при перегрузке теряются старые события;
+- точная доставка не гарантируется;
+- без metrics оператор может не заметить рост `DroppedCount`.
+
+---
+
+## 8. Batching: окно, а не snapshot
+
+Наивная реализация часто делает:
+
+```text
+WaitToReadAsync
+→ прочитать всё доступное сейчас
+→ немедленно flush
+```
+
+При равномерном трафике это способно давать batch по одному элементу: consumer просыпается на каждой новой записи раньше, чем накопится группа.
+
+Текущий `BatchWriterService` использует **windowed accumulation**.
+
+### Алгоритм
+
+1. Ожидается первая запись нового окна.
+2. После её появления запускается `BatchTimeout`.
+3. Все доступные элементы читаются синхронно через `TryRead`.
+4. Если batch ещё не полон, consumer ждёт следующий элемент внутри текущего timeout.
+5. Окно закрывается по первому условию:
+   - достигнут `BatchSize`;
+   - истёк `BatchTimeout`;
+   - channel завершён;
+   - начался shutdown.
+6. Batch передаётся repository.
+
+Например, при `BatchSize = 8` двадцать быстрых сообщений должны сформировать:
+
+```text
+[8, 8, 4]
+```
+
+а не двадцать batch по одному сообщению.
+
+### Почему batch хранится в `List<LogEntry>`
+
+Размер заранее известен из Options:
 
 ```csharp
-// ✓ IndexOf — только возвращает индекс, без аллокаций
-int gt = span.IndexOf((byte)'>');
-
-// ✓ Slice — только меняет указатель и длину
-ReadOnlySpan<byte> priField = span[1..gt];
-
-// ✓ SequenceEqual с UTF-8 литералами
-if (severitySpan.SequenceEqual("info"u8)) ...
-
-// ✓ Utf8Parser — парсит прямо из байт
-Utf8Parser.TryParse(span[1..gt], out int priority, out _);
+new List<LogEntry>(BatchSize)
 ```
 
-### 2.4 UTF-8 литералы: `"info"u8`
+Это даёт один переиспользуемый внутренний массив на жизненный цикл service loop. После flush вызывается `Clear`, capacity сохраняется.
 
-Особого внимания заслуживает синтаксис `"info"u8`, появившийся в C# 11. Это **компиляторная директива**: вместо создания строки в рантайме компилятор встраивает байты `[0x69, 0x6E, 0x66, 0x6F]` прямо в секцию `.rdata` сборки. В рантайме создаётся только `ReadOnlySpan<byte>`, указывающий в статическую память:
+### Освобождение ресурсов
 
-```csharp
-// Это выражение не аллоцирует ничего во время выполнения.
-// Четыре байта лежат в сборке с момента компиляции.
-if (severity.SequenceEqual("info"u8))
-    return SyslogSeverity.Info;
+`SaveAndDisposeAsync` вызывает repository и затем в `finally` освобождает каждый `RawBuffer`.
+
+Это защищает memory pool даже если SQLite или другой repository path выбросил исключение.
+
+### Семантика ошибки primary
+
+Текущая реализация не повторяет неудачный SQLite batch:
+
+```text
+primary throws
+→ BatchWriterService logs error
+→ entries dropped
+→ RawBuffer Dispose
 ```
 
-`SequenceEqual` на современном CPU выполняется одной векторной инструкцией (`VMOVD`). Сравнение строки с четырьмя байтами — буквально одна инструкция процессора.
+Такой выбор предотвращает бесконечное удержание памяти, но означает реальную потерю данных при transient SQLite error. Retry/outbox пока не реализованы.
 
-### 2.5 Архитектура парсера: пять срезов
+---
 
-Парсер `SyslogParser` обрабатывает строку вида:
+## 9. Нормальная остановка и drain
 
-```
-<30>Jun  4 18:00:00 mtk-router : firewall,info forward: in:ether1...
-```
+Hosted services зарегистрированы в порядке:
 
-Алгоритм — это последовательность из пяти `IndexOf` + срезов, ни один из которых не создаёт копии данных:
-
-```
-cursor = 0
-  ↓
-[1] IndexOf('>') → PRI = span[1..angleClose], cursor += angleClose + 1
-[2] фиксированные 15 байт → Timestamp, cursor += 16
-[3] IndexOf(" : ") → Hostname = span[cursor..sepAt], cursor += sepAt + 3
-[4] IndexOf(',') → Topic = span[cursor..commaAt], cursor += commaAt + 1
-[5] IndexOf(' ') → Severity, cursor += spaceAt + 1
-    Message = span[cursor..] — всё остальное
+```text
+BatchWriterService
+UdpSyslogListener
 ```
 
-Каждый «срез» — это новый `ReadOnlySpan<byte>` или `ReadOnlyMemory<byte>`, указывающий в исходный буфер. Данные не копируются ни разу.
+Generic Host останавливает их в обратном порядке:
 
-> **Важно.** Существование `SyslogParser` как *статического класса* — намеренное решение. Статическая функция, принимающая `ReadOnlyMemory<byte>` и возвращающая `LogEntry` через `out`-параметр, является наиболее эффективным способом выразить «чистое преобразование без побочных эффектов». Тонкие адаптеры `MikroTikSyslogParser` и `WinBeatLogParser` реализуют интерфейс `ILogParser`, делегируя вызов статике — так достигается и абстракция, и производительность.
+1. listener перестаёт принимать новые datagram;
+2. listener вызывает `OwnedIngress.Complete()`;
+3. writer дочитывает channel;
+4. неполный хвост сохраняется;
+5. `RawBuffer` каждого принятого entry освобождается.
 
-### 2.6 Разница между `Span<T>` и `Memory<T>`
+`BatchWriterService` отдельно обрабатывает shutdown во время открытого batch-window и выполняет final drain через `CancellationToken.None`, чтобы уже принятые записи получили шанс дойти до primary storage.
 
-`ReadOnlySpan<byte>` — это `ref struct`. Он существует только на стеке и не может быть сохранён в поле класса или структуры, передан в асинхронный метод или положен в `Channel`. После того как метод вернул управление, span уничтожен.
+Тесты проверяют:
 
-`ReadOnlyMemory<byte>` — обычная структура. Она описывает тот же участок памяти, но может жить где угодно: в поле `LogEntry`, в ring-buffer `Channel`, на куче. Когда распарсенная запись должна пережить вызов `TryParse` и улететь через `Channel` в `BatchWriterService`, поля `LogEntry` должны быть `ReadOnlyMemory<byte>`, а не `ReadOnlySpan<byte>`.
+- сохранение tail;
+- shutdown под нагрузкой;
+- ровно одно освобождение owner;
+- отсутствие потерь внутри уже принятого тестового channel.
 
+### Граница гарантии
+
+Drain относится только к записям, уже находящимся внутри ingress или batch. UDP-пакет, который ещё находился в kernel buffer или в сети, не становится частью гарантии приложения.
+
+Кроме того, host/container/service manager должен дать процессу достаточно времени до принудительного `SIGKILL`.
+
+---
+
+## 10. Почему SQLite — обязательный primary sink
+
+Конфигурация строится из массива `LogSinks`. Для каждого элемента выбирается `ISinkFactory` по полю `Type`.
+
+При startup проверяется:
+
+- `LogSinks` не пуст;
+- каждый entry имеет `Type`;
+- type зарегистрирован;
+- найден ровно один `Sqlite`.
+
+SQLite является source of truth. Loki и Console не могут заменить primary.
+
+### Контракт `FanOutLogRepository`
+
+```text
+await SQLite primary
+    ├─ failure → throw to BatchWriterService
+    └─ success
+        → run secondaries in parallel
+        → timeout/errors are logged and swallowed
 ```
-SyslogParser.TryParse()
-│   ┌── span-срезы (ReadOnlySpan) — только здесь, только на стеке
-│   └── source.Slice(offset, length) → ReadOnlyMemory — уходит в LogEntry
-└── return LogEntry { Hostname = ReadOnlyMemory<byte>, ... }
-                         ↓
-                   Channel.Writer.WriteAsync()
-                         ↓
-               BatchWriterService.SaveBatchAsync()
-                         ↓
-               Encoding.UTF8.GetString(entry.Hostname.Span)
-               ← здесь создаётся первая строка за весь путь
+
+Это исправляет важную семантическую проблему обычного `Task.WhenAll` по всем sinks. Если SQLite уже выполнила commit, а Loki упал, batch нельзя называть потерянным в основном хранилище.
+
+### Secondary timeout
+
+Все secondary sinks получают linked token с budget 5 секунд. Они запускаются параллельно. Ошибка одного secondary не мешает другому.
+
+Ограничение текущей схемы: writer всё равно ждёт завершения secondaries или истечения budget перед чтением следующего batch. Поэтому медленный Loki может задержать pipeline до пяти секунд, хотя не отменит primary commit.
+
+Для полной изоляции Loki нужен отдельный bounded channel или durable outbox.
+
+---
+
+## 11. SQLite implementation
+
+`SqliteLogSink` использует:
+
+- одну connection на lifetime sink;
+- `journal_mode=WAL`;
+- `synchronous=NORMAL`;
+- `busy_timeout=5000`;
+- prepared `INSERT` command;
+- transaction на batch;
+- переиспользуемые `SqliteParameter`.
+
+### Почему одна connection
+
+Pipeline имеет одного штатного batch writer. Одна connection и одна prepared command уменьшают повторное открытие базы и подготовку SQL.
+
+### Почему transaction на batch
+
+Без transaction каждое `INSERT` может потребовать отдельного commit. При batch одна транзакция покрывает до `BatchSize` строк.
+
+### Где появляются строки
+
+`LogEntry` несёт UTF-8 bytes. Перед присваиванием SQLite parameters sink вызывает `Encoding.UTF8.GetString`.
+
+Полностью убрать эту аллокацию в текущей TEXT-schema нельзя. Важно, что строки создаются поздно — после batching, непосредственно на storage boundary.
+
+### Schema и индексы
+
+Таблица содержит:
+
+```text
+Priority
+TimestampRaw
+Hostname
+Topic
+Severity
+Message
+ReceivedAt
+```
+
+Индексы созданы по:
+
+```text
+ReceivedAt
+Hostname
+Severity
+```
+
+### Ограничения SQLite path
+
+- один writer подходит текущей архитектуре;
+- retention не реализован;
+- source IP не сохраняется;
+- при ошибке batch нет retry;
+- длительное firewall logging может быстро увеличить файл;
+- WAL backup нельзя сводить к копированию одного `logs.db` во время активной записи.
+
+---
+
+## 12. Loki как best-effort secondary
+
+`LokiLogSink` вызывается только после успешного SQLite primary.
+
+### Grouping
+
+Текущая реализация группирует entries только по `Hostname`:
+
+```text
+один Loki stream на distinct hostname в batch
+```
+
+В stream labels входят:
+
+- статические labels из конфигурации, например `app=logcollector`;
+- динамический `hostname`.
+
+`Topic`, `Severity` и текст message не добавляются как labels текущей реализацией.
+
+Это уменьшает cardinality индекса. Message отправляется как log line.
+
+### Почему manual grouping
+
+Для key используется `ReadOnlyMemory<byte>` с `ReadOnlyMemoryByteComparer`, который сравнивает содержимое без предварительного преобразования каждого hostname в string.
+
+String создаётся один раз на distinct hostname в batch, а не на каждую запись при grouping.
+
+### HTTP policy
+
+Для каждого push:
+
+- endpoint: `/loki/api/v1/push`;
+- per-request timeout: 2 секунды;
+- максимум две повторные попытки после первой;
+- 4xx считается permanent и не повторяется;
+- network error, timeout и 5xx считаются transient;
+- caller cancellation пробрасывается;
+- каждый `HttpResponseMessage` освобождается;
+- после исчерпания попыток ошибка логируется, но не выбрасывается как потеря SQLite batch.
+
+### Граница best-effort
+
+Если Loki был недоступен, пропущенные данные остаются в SQLite, но автоматически не отправляются повторно после восстановления. Для replay нужен outbox или отдельный механизм чтения SQLite.
+
+---
+
+## 13. Config-driven sinks и расширяемость
+
+Новый sink добавляется так:
+
+1. реализовать `ILogSink`;
+2. создать `ISinkFactory`;
+3. зарегистрировать factory в `ServiceCollectionExtensions`;
+4. добавить элемент в `LogSinks`.
+
+Listener, parser и batch writer при этом не меняются.
+
+Но primary semantics сейчас зафиксирована специально для SQLite: DI требует ровно один `Type=Sqlite`. Добавить другой primary без изменения composition logic нельзя. Это осознанное ограничение текущего продукта, а не полностью универсальная sink framework.
+
+---
+
+## 14. Options validation
+
+`SyslogListenerOptionsValidator` проверяет:
+
+```text
+Port: 1..65535
+MaxDatagramSize: 256..65507
+```
+
+`BatchWriterOptionsValidator` проверяет:
+
+```text
+BatchSize: 1..10000
+BatchTimeout: > 0 и <= 30 секунд
+```
+
+`ValidateOnStart` переносит ошибку конфигурации на startup, до нормального приёма трафика.
+
+Sink-specific значения (`ConnectionString`, `Endpoint`, type names) проверяются во время построения `ILogRepository` через factories и DI logic.
+
+---
+
+## 15. Потоки, concurrency и ownership
+
+### Producer
+
+Штатный producer один — `UdpSyslogListener`. Но `OwnedIngress` не заявляет `SingleWriter=true`, потому что completion и возможные будущие producer paths не объединены строгим single-writer контрактом.
+
+### Consumer
+
+Штатный consumer один — `BatchWriterService`. Однако eviction-path тоже читает старый item из channel, поэтому внутреннему channel требуется `SingleReader=false`.
+
+### SQLite
+
+`SqliteLogSink` рассчитан на последовательные вызовы от одного writer. Он не защищает connection/command от конкурентного `SaveBatchAsync` несколькими потоками. Текущий pipeline соблюдает это ограничение.
+
+### Loki secondaries
+
+`FanOutLogRepository` запускает разные secondary sinks параллельно, но один и тот же sink получает один вызов на batch из последовательного main writer.
+
+---
+
+## 16. Карта владения буфером
+
+| Сценарий | Кто освобождает `RawBuffer` |
+|---|---|
+| Parser не распознал datagram | `UdpSyslogListener` в `finally` |
+| Entry принят ingress и затем сохранён | `BatchWriterService.SaveAndDisposeAsync` |
+| Entry принят ingress, repository выбросил exception | `BatchWriterService.SaveAndDisposeAsync` в `finally` |
+| Очередь переполнена, старый entry вытеснен | `OwnedIngress.TryEnqueue` |
+| После вытеснения новая запись неожиданно не записалась | `OwnedIngress.TryEnqueue` освобождает новый owner |
+| Штатная остановка с хвостом | final drain writer, затем `SaveAndDisposeAsync` |
+
+Ключевой invariant:
+
+```text
+каждый rented owner либо передан ingress, либо немедленно Dispose;
+после передачи ingress listener его больше не освобождает.
 ```
 
 ---
 
-## Глава 3. Value Types как оружие: `readonly struct`
+## 17. Failure semantics
 
-### 3.1 Стек против кучи
+| Сбой | Текущее поведение |
+|---|---|
+| Datagram не распознана | buffer освобождается, запись не создаётся |
+| SocketException в receive loop | warning, listener продолжает работу |
+| Ingress заполнен | старейшая запись и её buffer удаляются |
+| SQLite initialization failed | startup writer завершается с ошибкой |
+| SQLite batch write failed | ошибка логируется, batch теряется, buffers освобождаются |
+| Loki startup недоступен | warning, приложение продолжает старт |
+| Loki 4xx | без retry, Loki copy теряется |
+| Loki timeout/network/5xx | ограниченные retry, затем Loki copy теряется |
+| Secondary завис | отмена после общего timeout, primary остаётся успешным |
+| Shutdown | listener завершает producer, writer пытается сохранить хвост |
 
-Когда вы объявляете переменную типа `class`, в куче создаётся объект, а на стеке — только ссылка на него (8 байт на 64-битной системе). GC должен отслеживать все живые ссылки и собирать объекты, на которые ссылок не осталось.
-
-Когда вы объявляете переменную типа `struct`, данные располагаются непосредственно там, где объявлена переменная: на стеке (для локальных переменных) или инлайн в массиве (для элементов `T[]`). GC не отслеживает значимые типы сами по себе — только ссылки на управляемые объекты внутри них.
-
-```
-// class LogEntry — два объекта в куче:
-//   1. Сам объект LogEntry (заголовок + поля)
-//   2. Ссылки на строковые поля (ещё объекты в куче)
-var entry = new LogEntry();     // ↑ Gen0 allocation
-
-// readonly struct LogEntry — ноль объектов в куче:
-//   Данные лежат прямо в переменной / в слоте Channel
-LogEntry entry = new LogEntry { ... };    // нет allocation
-```
-
-### 3.2 `Channel<T>` и value types
-
-`Channel<T>` реализован на основе кольцевого массива (`T[]`). Когда `T` является структурой, элементы массива хранят значения инлайн — никакого боксинга, никаких ссылок на отдельные объекты в куче:
-
-```
-Channel ring buffer (T = LogEntry, struct):
-┌──────────────────────────────────────────────────────┐
-│ [LogEntry][LogEntry][LogEntry][LogEntry][LogEntry]... │
-│  ← 96 bytes each, stored inline, GC sees only the    │
-│    IMemoryOwner<byte>? reference inside each slot →  │
-└──────────────────────────────────────────────────────┘
-```
-
-При 10 000 записей в секунду копирование 96-байтной структуры в слот Channel и обратно — это меньше 2 МБ/с операций копирования. Для современного CPU это буквально незаметно, а GC при этом не нагружается совсем.
-
-### 3.3 Размер структуры имеет значение
-
-`LogEntry` в нашем проекте весит около 96 байт:
-
-```
-int    Priority      :  4 байта
-byte   Severity      :  1 байт  (+3 padding)
-ReadOnlyMemory<byte> × 4 поля  : 16 × 4 = 64 байта
-DateTimeOffset ReceivedAt      : 16 байт
-IMemoryOwner<byte>? RawBuffer  :  8 байт (ссылка)
-                              ──────────
-                               96 байт
-```
-
-Структуры больше 64 байт начинают терять часть преимущества — они не помещаются в одну кэш-линию CPU (обычно 64 байта). Тем не менее 96-байтная структура по-прежнему несравнимо лучше, чем объект в куче: мы платим за одно копирование данных, но полностью исключаем GC-аллокации для самих записей.
-
-> **Правило 2.** Тип, который тысячи раз в секунду проходит через Channel, должен быть `readonly struct`. Это не преждевременная оптимизация — это основной критерий выбора между `class` и `struct` для горячего пути.
+Эта таблица важнее общего заявления «сервис надёжный»: она точно показывает, где данные сохраняются, где могут быть потеряны и что происходит с памятью.
 
 ---
 
-## Глава 4. Конкурентность без блокировок: `System.Threading.Channels`
+## 18. Почему нет Native AOT
 
-### 4.1 Проблема Producer-Consumer
+Текущая реализация не использует Dapper; SQLite доступ реализован напрямую через `Microsoft.Data.Sqlite` и prepared command.
 
-Сетевой слушатель и модуль записи в базу данных живут в разных темпах. Слушатель может получать по тысяче пакетов в секунду, а SQLite записывает пакетами, каждый из которых занимает несколько миллисекунд. Если связать их напрямую, или слушатель будет ждать записи (потеряем пакеты), или запись будет вызываться тысячи раз в секунду (уничтожим производительность SQLite).
+Тем не менее Native AOT не включён автоматически, потому что для него требуется отдельная проверка всей dependency graph:
 
-Классическое решение — буфер-посредник. В .NET 5 появился первоклассный инструмент для этого: `System.Threading.Channels`.
+- trimming compatibility Generic Host и Options;
+- JSON serialization Loki payload;
+- systemd integration;
+- SQLite native dependencies;
+- publish/runtime tests для нужных Linux architectures.
 
-### 4.2 Bounded Channel: ограниченная ёмкость как свойство
-
-`Channel.CreateBounded<T>` создаёт канал с максимальной ёмкостью. Попытка записи в заполненный канал не паникует и не дропает данные — она **ждёт**, пока потребитель не освободит место.
-
-```csharp
-var channel = Channel.CreateBounded<LogEntry>(
-    new BoundedChannelOptions(capacity: 10_000)
-    {
-        FullMode                      = BoundedChannelFullMode.Wait,
-        SingleWriter                  = true,   // hint для lock-free пути
-        SingleReader                  = true,
-        AllowSynchronousContinuations = false,  // важно — см. ниже
-    });
-```
-
-Ограниченная ёмкость — это **обратное давление** (backpressure). Когда канал полон, `WriteAsync` в слушателе приостанавливается. Слушатель перестаёт вычитывать дейтаграммы из сокета. ОС-буфер сокета заполняется. Роутер видит, что получатель занят. Система деградирует **управляемо**, а не паникой OOM.
-
-> **Примечание о `AllowSynchronousContinuations = false`.** Если этот флаг `true`, продьюсер после успешного `WriteAsync` может немедленно запустить продолжение консьюмера на своём же потоке. В петле приёма UDP это означает: поток слушателя внезапно начинает выполнять код `BatchWriterService`. Это ломает модель backpressure: `BatchWriterService` запускается раньше, чем слушатель успевает убедиться, что канал всё ещё не переполнен. Всегда устанавливайте `false` при `SingleWriter = true` в сетевых приложениях.
-
-### 4.3 Паттерн Клири: `WaitToReadAsync` + `TryRead`
-
-Наивный способ вычитывать из Channel — `ReadAsync` в цикле. Каждый вызов `ReadAsync` — это `await`, то есть потенциальное переключение контекста. При 10 000 записях в секунду это 10 000 `await`-операций в секунду.
-
-Паттерн Клири (по имени Стивена Клири, автора книги «Concurrency in C#») разделяет ожидание и вычитывание:
-
-```csharp
-// ✓ Паттерн Клири
-while (await reader.WaitToReadAsync(ct))    // ← один await, спим пока нет данных
-{
-    while (reader.TryRead(out var entry))   // ← синхронно выгребаем всё подряд
-    {
-        batch.Add(entry);
-        if (batch.Count >= BatchSize) break;
-    }
-    await repository.SaveBatchAsync(batch, ct);  // ← один INSERT на весь батч
-    batch.Clear();
-}
-```
-
-`WaitToReadAsync` паркует поток до появления хотя бы одного элемента. `TryRead` — полностью синхронный, без переключений контекста. После одного `await` мы вычитываем всё, что успело накопиться. При нагрузке 10 000 записей/сек и батче 500 — это 20 `await`-операций в секунду вместо 10 000. Разница на два порядка.
-
-### 4.4 Батчинг и SQLite: почему одна транзакция на батч
-
-Каждый `COMMIT` в SQLite — это `fsync` к диску. На современном SSD `fsync` занимает 0.5–5 мс. Если писать по одной записи:
-
-```
-10 000 записей/сек × 1 мс/COMMIT = 10 секунд дисковой работы в секунду
-```
-
-Система физически не успевает. С батчем в 500 записей:
-
-```
-20 COMMIT/сек × 1 мс = 20 мс дисковой работы в секунду
-```
-
-Плюс `cmd.Prepare()` компилирует SQL-план один раз на батч — в цикле мы только подставляем значения в уже скомпилированный запрос. Итоговая разница в пропускной способности — 20–50 раз.
+Небольшой chiseled runtime image уже уменьшает production footprint без изменения модели выполнения. Переход к AOT должен быть отдельной измеряемой задачей, а не декларативным флагом в Dockerfile.
 
 ---
 
-## Глава 5. Обратное давление: контролируемая деградация
+## 19. Границы текущей версии
 
-### 5.1 Четыре стратегии заполненного канала
-
-При выборе `BoundedChannelFullMode` важно понимать последствия каждого варианта:
-
-| Режим | Что происходит | Когда применять |
-|---|---|---|
-| `Wait` | Продьюсер приостанавливается | TCP-соединения, gRPC-стримы — протоколы с реальным flow control |
-| `DropWrite` | Новая запись отбрасывается | Метрики/телеметрия, где потеря точки некритична; вызывающий код должен сам `Dispose` RawBuffer |
-| `DropOldest` | Самая старая запись вытесняется | UDP-сборщики логов — свежесть важнее полноты; см. примечание о RawBuffer ниже |
-| `DropNewest` | Только что добавленная запись выбрасывается | Редко; семантически эквивалентно `DropWrite` через другой путь |
-
-Для сборщика логов единственный правильный выбор — `Wait`. Потеря логов именно во время инцидента (когда нагрузка максимальна) — это худшее, что может произойти с системой мониторинга.
-
-### 5.2 UDP не имеет обратного давления — и это меняет выбор режима
-
-Здесь важно не ошибиться. Обратное давление работает только в протоколах с подтверждением: TCP, gRPC, AMQP. UDP — fire-and-forget. Роутер отправил пакет и забыл. Никакого ACK, никакого flow control. MikroTik никогда не узнает, что получатель перегружен.
-
-Реальная цепочка при `Wait` выглядит так:
-
-```
-BatchWriterService медленно пишет в SQLite
-    ↓ канал заполняется до capacity
-Channel.Writer.WriteAsync приостанавливается
-    ↓ UdpSyslogListener перестаёт вызывать ReceiveFromAsync
-ОС-буфер сокета заполняется (обычно 200–400 КБ, ~200–500 дейтаграмм)
-    ↓ ядро Linux тихо дропает входящие UDP-пакеты
-MikroTik продолжает слать с той же скоростью — он ничего не знает
-```
-
-`Wait` — это не backpressure к роутеру. Это замораживание слушателя. Пока он заморожен, теряются **самые новые** дейтаграммы — те, что приходят пока канал переполнен. В канале при этом лежат **самые старые** записи — те, что уже ждут записи в SQLite.
-
-Для сборщика логов это плохая семантика. Когда на сети происходит инцидент, нужны именно свежие логи. `Wait` в момент перегрузки сохраняет двухминутной давности `firewall,info` и дропает текущие `firewall,error`.
-
-**`BoundedChannelFullMode.DropOldest` семантически правильнее** для UDP-коллектора: при переполнении канала вытесняется самая старая ожидающая запись, освобождая место для свежей. Свежесть данных приоритетнее полноты.
-
-> **Предупреждение: RawBuffer и DropOldest.** Когда `Channel` вытесняет старый `LogEntry`, он просто удаляет его из кольцевого буфера — никакой `Dispose` не вызывается. Поле `RawBuffer` (`IMemoryOwner<byte>`) теряет последнюю ссылку и в конце концов будет собрано GC. Но `byte[]` внутри не вернётся в кэш `ArrayPool` — вместо этого пул выделит новый массив. Под устойчивой перегрузкой это создаёт GC-давление именно тогда, когда система и без того работает на пределе. Решение — держать `capacity` достаточно большим (10 000 записей ≈ 1 секунда пиковой нагрузки), чтобы `DropOldest` срабатывал только при действительно аномальных всплесках, а не в штатном режиме.
-
-> **Предостережение.** Unbounded channel (`Channel.CreateUnbounded<T>()`) — это замедленная бомба. При кратковременном всплеске он накапливает элементы быстрее, чем потребитель успевает обработать. Через несколько минут под пиковой нагрузкой процесс может занять несколько гигабайт памяти. Используйте `Unbounded` только если *доказали*, что продьюсер гарантированно не может обогнать консьюмера.
+- UDP/IPv4;
+- один bound address `0.0.0.0`;
+- BSD Syslog/RFC 3164 и MikroTik extension;
+- без RFC 5424;
+- без TCP/TLS syslog;
+- timestamp устройства хранится без года и timezone;
+- IP sender не сохраняется;
+- ingress capacity 10 000 пока hardcoded;
+- overflow policy — drop oldest;
+- SQLite retry отсутствует;
+- retention SQLite отсутствует;
+- Loki best-effort без replay;
+- Loki может задержать следующий batch до secondary timeout;
+- один SQLite writer;
+- горизонтальное масштабирование потребует другой модели storage/coordination;
+- нет metrics endpoint и настоящего readiness endpoint.
 
 ---
 
-## Глава 6. Владение памятью: `ArrayPool`, `MemoryPool` и паттерн передачи
+## 20. Следующие архитектурные шаги
 
-### 6.1 Два буфера в слушателе
+Для эксплуатации с несколькими MikroTik приоритетны:
 
-Проблема, которую легко пропустить: `UdpSyslogListener` использует **один** pinned-буфер для приёма, но `LogEntry` держит ссылки на срезы памяти, которые должны жить дольше, чем один цикл `ReceiveFromAsync`. Решение — два буфера:
+1. добавить source IP в domain и SQLite schema;
+2. экспортировать счётчики received, parsed, rejected, ingress dropped;
+3. измерять channel depth и batch latency;
+4. добавить retention worker для SQLite;
+5. различать transient/permanent SQLite failures и реализовать bounded retry;
+6. вынести Loki в отдельный bounded pipeline;
+7. добавить readiness, отражающий UDP bind и SQLite initialization;
+8. провести burst/load test на реальных RouterOS сообщениях;
+9. проверить backup и restore WAL-базы;
+10. сделать capacity и secondary timeout конфигурируемыми после benchmark.
 
-```
-Буфер 1: _pinnedReceiveBuffer
-  - GC.AllocateArray<byte>(size, pinned: true)
-  - Живёт весь срок службы сервиса
-  - Используется ОС для записи принятых байт (DMA)
-  - Перезаписывается при каждом следующем ReceiveFromAsync
-
-Буфер 2: datagramOwner (MemoryPool<byte>.Shared.Rent)
-  - Рентуется из пула при каждой дейтаграмме
-  - Получает копию данных из Буфера 1
-  - Остаётся стабильным, пока LogEntry жива
-  - Возвращается в пул после записи в SQLite
-```
-
-Почему Буфер 1 должен быть pinned? Когда `Socket.ReceiveFromAsync` уходит в ядро ОС, система выполняет DMA-запись напрямую в указанный адрес памяти. Если GC в этот момент переместит `byte[]` в другое место памяти — ОС запишет данные по старому адресу, а программа прочитает по новому. `GC.AllocateArray<byte>(size, pinned: true)` помещает массив в Pinned Object Heap (POH), который GC никогда не дефрагментирует.
-
-### 6.2 Паттерн передачи владения
-
-Объект `IMemoryOwner<byte>` — это RAII-контракт для управляемого кода: тот, кто владеет объектом, несёт ответственность за вызов `Dispose()`. Когда владение передаётся через `Channel`, нужна явная точка передачи:
-
-```csharp
-IMemoryOwner<byte>? owner = MemoryPool<byte>.Shared.Rent(length);
-bool transferred = false;
-
-try
-{
-    // ... заполнить буфер, распарсить, создать entry ...
-
-    entry = entry with { RawBuffer = owner };   // 1. прикрепить к entry
-    await writer.WriteAsync(entry, ct);          // 2. отправить в Channel
-    transferred = true;                          // 3. пометить как переданное
-}
-finally
-{
-    if (!transferred)
-        owner?.Dispose();    // вернуть в пул если что-то пошло не так
-}
-```
-
-Нулирование флага `transferred` — единственная надёжная защита от двух возможных ошибок: утечки (забыли вернуть) и двойного освобождения (вернули дважды).
-
-> **Правило 3.** В коде управления памятью с пулами всегда явно отслеживайте, передано ли владение. `bool ownershipTransferred = false` в начале + `ownershipTransferred = true` сразу после успешной передачи + проверка в `finally` — это обязательный паттерн, не опциональный.
-
----
-
-## Глава 7. Чистая архитектура как инструмент расширяемости
-
-### 7.1 Зависимости должны смотреть внутрь
-
-Clean Architecture задаёт одно правило: зависимости всегда направлены от внешних слоёв к внутренним. Core ничего не знает об Infrastructure. Infrastructure знает о Core и Application. Host знает обо всём, но является последним звеном — ни один слой не зависит от Host.
-
-```
-             ┌──────────────────────────────────────┐
-             │             LogCollector.Host         │
-             │  (точка компоновки, ни от кого не    │
-             │   зависит, знает обо всех слоях)      │
-             └─────────────────┬────────────────────┘
-                               │ зависит от
-             ┌─────────────────▼────────────────────┐
-             │       LogCollector.Infrastructure     │
-             │  (SQLite, Socket, MemoryPool — детали │
-             │   реализации интерфейсов Application) │
-             └─────────────────┬────────────────────┘
-                               │ зависит от
-             ┌─────────────────▼────────────────────┐
-             │        LogCollector.Application       │
-             │  (ILogParser, ILogRepository —        │
-             │   контракты без реализации)            │
-             └─────────────────┬────────────────────┘
-                               │ зависит от
-             ┌─────────────────▼────────────────────┐
-             │           LogCollector.Core           │
-             │  (LogEntry, SyslogSeverity —           │
-             │   чистые типы домена, ноль зависимостей) │
-             └──────────────────────────────────────┘
-```
-
-### 7.2 Инверсия зависимости: `ILogRepository`
-
-Первоначальный `BatchWriterService` открывал `SqliteConnection` напрямую. Это означало: изменить базу данных = менять бизнес-логику батчинга. После рефакторинга `BatchWriterService` знает только об `ILogRepository`:
-
-```csharp
-// До рефакторинга — Infrastructure знает о SQLite
-public sealed class BatchWriterService : BackgroundService
-{
-    private readonly string _connectionString;
-
-    private async Task WriteBatch(List<LogEntry> batch)
-    {
-        await using var conn = new SqliteConnection(_connectionString);  // ← SQLite здесь
-        // ...
-    }
-}
-
-// После — Infrastructure знает только об абстракции
-public sealed class BatchWriterService : BackgroundService
-{
-    private readonly ILogRepository _repository;  // ← только контракт
-
-    private async Task SaveAndDisposeAsync(List<LogEntry> batch, CancellationToken ct)
-    {
-        await _repository.SaveBatchAsync(batch, ct);  // ← реализация — чужая забота
-    }
-}
-```
-
-Последствие: тесты для `BatchWriterService` теперь не нуждаются в SQLite. Достаточно передать `InMemoryLogRepository`:
-
-```csharp
-var fakeRepo = new InMemoryLogRepository();
-var service  = new BatchWriterService(channel.Reader, fakeRepo, opts, logger);
-// тест на тайминг, disposal, drain — без единого файла на диске
-```
-
-### 7.3 Composite Pattern для форматов логов
-
-`UdpSyslogListener` должен уметь обрабатывать несколько форматов (MikroTik, WinBeat) без `if/else if` внутри цикла приёма. Решение — паттерн Composite через `ILogParser`:
-
-```csharp
-// ServiceCollectionExtensions.cs — единственное место, где знают о форматах
-services.AddSingleton<MikroTikSyslogParser>();
-// services.AddSingleton<WinBeatLogParser>();  ← добавить когда нужно
-
-services.AddSingleton<ILogParser>(sp => new CompositeLogParser(
-    sp.GetRequiredService<MikroTikSyslogParser>()
-    // sp.GetRequiredService<WinBeatLogParser>()  ← и здесь
-));
-```
-
-Добавление нового формата — это создание одного нового файла и две строки в `ServiceCollectionExtensions`. `UdpSyslogListener`, `BatchWriterService`, `ILogRepository` — ни один из них не меняется. Это и есть принцип Open/Closed в действии.
-
----
-
-## Глава 8. Тестирование производительных систем
-
-### 8.1 Два уровня тестов
-
-Для высоконагруженного кода нужны тесты двух категорий, которые нельзя смешивать:
-
-**Уровень 1 — юнит-тесты с фейками.** Тестируют логику без I/O. `BatchWriterService` с `InMemoryLogRepository` — это тест на тайминг, backpressure, порядок disposal. Выполняется за миллисекунды, без диска, без сети.
-
-**Уровень 2 — интеграционные тесты с реальными зависимостями.** Тестируют корректность round-trip. `SqliteLogRepository` с именованной in-memory базой SQLite — это проверка того, что байты правильно превращаются в строки, строки правильно попадают в `TEXT`-колонку, и значение можно прочитать обратно без искажений.
-
-### 8.2 Архитектурный тест
-
-Один из тестов `SyslogParserTests` стоит особого внимания:
-
-```csharp
-[Fact]
-public void TryParse_AllMemoryFields_AreSlicesOfSourceBuffer_ZeroCopyProof()
-{
-    byte[] source = Encoding.UTF8.GetBytes(SampleLine);
-    SyslogParser.TryParse(source.AsMemory(), DateTimeOffset.UtcNow, out var entry);
-
-    MemoryMarshal.TryGetArray(entry.Hostname, out var seg);
-
-    Assert.Same(source, seg.Array);   // тот же объект — не копия
-    Assert.Equal(20, seg.Offset);     // правильное смещение в буфере
-    Assert.Equal(10, seg.Count);      // правильная длина
-}
-```
-
-`MemoryMarshal.TryGetArray` — это рефлексия над внутренностями `ReadOnlyMemory<byte>`. Она возвращает исходный `byte[]` и смещение. Если результат `Assert.Same` проходит — данные не скопированы, поле указывает прямо в исходный буфер. Это **формальное доказательство** архитектурной гарантии, а не просто «мы так написали».
-
----
-
-## Заключение: три правила производительного проектирования
-
-Всё, о чём мы говорили, можно свести к трём правилам:
-
-**Правило 1 (Кокоса).** На горячем сетевом пути — нулевая аллокация. Используй `ReadOnlySpan<byte>`, `IndexOf`, срезы. Строки создавай только перед самой передачей во внешнюю систему.
-
-**Правило 2 (Рихтер).** Тип, который тысячи раз в секунду проходит через канал или коллекцию, должен быть `readonly struct`. Это не оптимизация — это правильный выбор типа.
-
-**Правило 3 (Клири).** Producer-Consumer строй на `BoundedChannel` с `FullMode.Wait`. Вычитывай пакетами через `WaitToReadAsync` + `TryRead`. Никогда не используй `Unbounded` без доказанных причин.
-
-Эти три правила применимы к любому высоконагруженному сервису на .NET: очередям сообщений, HTTP-прокси, телеметрическим агентам, стриминговым пайплайнам. Синтаксис меняется. Принципы — нет.
-
----
-
-## Приложение: итоговая структура LogCollector
-
-```
-LogCollector.sln
-├── Core           — LogEntry (readonly struct), SyslogSeverity (enum)
-├── Application    — ILogParser, ILogRepository
-├── Infrastructure
-│   ├── Parsers    — SyslogParser (static), MikroTikSyslogParser, CompositeLogParser
-│   ├── Listeners  — UdpSyslogListener (BackgroundService)
-│   ├── Persistence — SqliteLogRepository, SqliteOptions
-│   └── Pipeline   — BatchWriterService (BackgroundService), BatchWriterOptions
-├── Host           — Program.cs (3 строки), appsettings.json, logcollector.service
-└── Tests
-    ├── Parsers    — SyslogParserTests (юнит + zero-copy proof)
-    └── Pipeline   — BatchWriterServiceTests (2 уровня: фейк + SQLite)
-```
-
-Поток данных:
-
-```
-UDP datagram → pinned buffer → pool buffer → SyslogParser → LogEntry
-              (GC.AllocateArray)  (MemoryPool)  (zero alloc)  (readonly struct)
-                                                                     ↓
-                                                          Channel<LogEntry>
-                                                          (Bounded, Wait)
-                                                                     ↓
-                                               BatchWriterService → SaveBatchAsync
-                                               (WaitToReadAsync +    (ILogRepository)
-                                                TryRead × N)              ↓
-                                                               SqliteLogRepository
-                                                               (1 tx / batch, WAL)
-```
+Текущая архитектура уже хорошо решает основную задачу: принимает UDP, ограничивает память, не теряет ownership pooled-буферов и отделяет обязательный SQLite primary от необязательных secondary sinks. Дальнейшее развитие должно усиливать наблюдаемость и эксплуатационную надёжность, а не переписывать базовый pipeline без измеримых причин.

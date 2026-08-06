@@ -1,25 +1,36 @@
-**/.git
-**/.gitignore
-**/.vs
-**/.vscode
+# VCS and IDE metadata
+.git
+.gitignore
+.vs
+.vscode
+.idea
+*.user
+*.suo
+
+# Build and test output
 **/bin
 **/obj
 **/TestResults
+BenchmarkDotNet.Artifacts
+.coverage
+.artifacts
 
-# Test project — not needed in the build image
-LogCollector.Tests/
-
-# Development artifacts
+# Runtime state
+**/data
 *.db
 *.db-shm
 *.db-wal
-dev-logs.db
 
-# Documentation
-*.md
-DESIGN_GUIDE.md
+# Local configuration and secrets
+.env
+secrets/*
+!secrets/*.example
 
-# Docker files themselves (avoid recursive context)
-Dockerfile
-docker-compose*.yml
-.dockerignore
+# Archives and temporary files
+*.zip
+*.tar
+*.tar.gz
+*.bak
+*.tmp
+.DS_Store
+Thumbs.db

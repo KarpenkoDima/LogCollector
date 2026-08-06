@@ -1,0 +1,253 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+  DOTNET_NOLOGO: "1"
+  NUGET_XMLDOC_MODE: skip
+
+jobs:
+  dotnet:
+    name: Build and test .NET
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install .NET 9 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Show SDK information
+        run: dotnet --info
+
+      - name: Restore solution
+        run: dotnet restore LogCollector.sln --nologo
+
+      - name: Build solution
+        run: >-
+          dotnet build LogCollector.sln
+          --configuration Release
+          --no-restore
+          --nologo
+          -p:ContinuousIntegrationBuild=true
+
+      - name: Run tests with coverage
+        run: >-
+          dotnet test LogCollector.Tests/LogCollector.Tests.csproj
+          --configuration Release
+          --no-build
+          --nologo
+          --logger "trx;LogFileName=logcollector-tests.trx"
+          --results-directory artifacts/test-results
+          --collect "XPlat Code Coverage"
+
+      - name: Publish Linux host
+        run: >-
+          dotnet publish LogCollector.Host/LogCollector.Host.csproj
+          --configuration Release
+          --no-restore
+          --nologo
+          --output artifacts/publish
+          -p:UseAppHost=false
+          -p:ContinuousIntegrationBuild=true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: artifacts/test-results
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload published host
+        uses: actions/upload-artifact@v4
+        with:
+          name: logcollector-linux-framework-dependent
+          path: artifacts/publish
+          if-no-files-found: error
+          retention-days: 14
+
+  compose:
+    name: Validate Compose and monitoring config
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare local-only configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          mkdir -p data secrets
+          printf '%s\n' 'ci-only-password-not-for-production' \
+            > secrets/grafana_admin_password.txt
+
+      - name: Validate production Compose
+        run: docker compose -f docker-compose.yml config > /tmp/compose-production.yml
+
+      - name: Validate development Compose
+        run: docker compose -f docker-compose.dev.yml config > /tmp/compose-development.yml
+
+      - name: Validate monitoring merge
+        run: >-
+          docker compose
+          -f docker-compose.yml
+          -f docker-compose.monitoring.yml
+          config
+          > /tmp/compose-monitoring.yml
+
+      - name: Validate Grafana dashboard JSON
+        run: python3 -m json.tool deploy/grafana/dashboards/logcollector.json > /dev/null
+
+      - name: Validate Loki configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          source .env
+          set +a
+
+          docker run --rm \
+            --volume "$PWD/deploy/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro" \
+            "$LOKI_IMAGE" \
+            -config.file=/etc/loki/loki-config.yaml \
+            -verify-config=true
+
+  container:
+    name: Build images and run UDP to SQLite smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs:
+      - dotnet
+      - compose
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build runtime image
+        run: >-
+          docker buildx build
+          --target runtime
+          --tag logcollector:ci-runtime
+          --load
+          .
+
+      - name: Build development image
+        run: >-
+          docker buildx build
+          --target development
+          --tag logcollector:ci-development
+          --load
+          .
+
+      - name: Verify runtime image user
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect logcollector:ci-runtime --format '{{.Config.User}}')" = "app"
+
+      - name: Install smoke-test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends netcat-openbsd sqlite3
+
+      - name: Smoke test UDP to SQLite
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cleanup() {
+            docker rm --force logcollector-ci >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          mkdir -p .ci-data
+          chmod 0777 .ci-data
+
+          docker run --detach \
+            --name logcollector-ci \
+            --publish 127.0.0.1:5514:5140/udp \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=32m,mode=1777 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --env DOTNET_ENVIRONMENT=Production \
+            --env DOTNET_EnableDiagnostics=0 \
+            --env SyslogListener__Port=5140 \
+            --env SyslogListener__MaxDatagramSize=8192 \
+            --env BatchWriter__BatchSize=1 \
+            --env BatchWriter__BatchTimeout=00:00:01 \
+            --env LogSinks__0__Type=Sqlite \
+            --env 'LogSinks__0__ConnectionString=Data Source=/app/data/logs.db;Cache=Shared' \
+            --volume "$PWD/.ci-data:/app/data" \
+            logcollector:ci-runtime
+
+          ready=0
+          for _ in $(seq 1 30); do
+            if docker logs logcollector-ci 2>&1 | grep -q 'Schema ready'; then
+              ready=1
+              break
+            fi
+
+            if [ "$(docker inspect logcollector-ci --format '{{.State.Running}}')" != "true" ]; then
+              docker logs logcollector-ci
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            docker logs logcollector-ci
+            echo 'Collector did not initialize SQLite in time.' >&2
+            exit 1
+          fi
+
+          printf '%s\n' \
+            '<132>Jul 14 12:30:45 ci-router : firewall,info ci-smoke-test' \
+            | nc -u -w 1 127.0.0.1 5514
+
+          rows=0
+          for _ in $(seq 1 30); do
+            rows="$(sqlite3 .ci-data/logs.db 'SELECT COUNT(*) FROM Logs;' 2>/dev/null || printf '0')"
+            if [ "${rows:-0}" -ge 1 ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "${rows:-0}" -lt 1 ]; then
+            docker logs logcollector-ci
+            echo 'UDP datagram was not persisted to SQLite.' >&2
+            exit 1
+          fi
+
+          sqlite3 .ci-data/logs.db \
+            "SELECT Hostname || '|' || Topic || '|' || Message FROM Logs ORDER BY Id DESC LIMIT 1;" \
+            | grep -F 'ci-router|firewall|ci-smoke-test'
+
+          docker stop --time 45 logcollector-ci

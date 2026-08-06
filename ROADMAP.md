@@ -1,80 +1,101 @@
 # Roadmap
 
-Планирование развития LogCollector по milestone'ам. Каждый milestone —
-законченный инкремент с чёткой целью.
+План развития LogCollector по milestone. Каждый milestone — законченный
+инкремент с понятной эксплуатационной целью.
 
 ## ✅ Milestone 1 — Работающий конвейер (v1.0)
 
 Первая версия, доказавшая жизнеспособность идеи.
 
-- [x] UDP-приём syslog
-- [x] Запись в SQLite
-- [x] Channel-based конвейер
-- [x] Первые unit-тесты
+- [x] UDP-приём syslog.
+- [x] Запись в SQLite.
+- [x] Channel-based конвейер.
+- [x] Первые unit-тесты.
 
 ## ✅ Milestone 2 — Production-архитектура (v2.0)
 
-Полное переписывание на zero-allocation Clean Architecture.
+Переписывание на Clean Architecture и low-allocation обработку.
 
-- [x] `readonly struct LogEntry` (Рихтер)
-- [x] Zero-allocation парсер (Кокоса)
-- [x] Batch-drain конвейер (Клири)
-- [x] FanOut-архитектура синков
-- [x] Docker Compose + Loki + Grafana
-- [x] BenchmarkDotNet с воспроизводимыми замерами
-- [x] 23 теста
+- [x] `readonly struct LogEntry`.
+- [x] Парсер на `ReadOnlySpan<byte>` без Regex и `string.Split`.
+- [x] Ownership datagram через `MemoryPool<byte>`.
+- [x] Пакетная запись в SQLite.
+- [x] Fan-out архитектура sinks.
+- [x] Loki и Grafana.
+- [x] BenchmarkDotNet с воспроизводимыми замерами.
+- [x] Unit и integration тесты.
 
 ## ✅ Milestone 3 — Production-эксплуатация (v2.1)
 
-Всё, что вскрылось при реальной работе на debian-cicd.
+Исправления, выявленные при реальном использовании.
 
-- [x] Исправление порта 514→5140
-- [x] Исправление двух тихих багов LokiLogSink
-- [x] `ReceivedAt` TEXT→INTEGER
-- [x] Persistent SQLite connection
-- [x] SocketAddress reuse
-- [x] Grafana dashboard в git
+- [x] Исправление публикации UDP-порта 514 → 5140 внутри контейнера.
+- [x] Исправление двух тихих дефектов `LokiLogSink`.
+- [x] `ReceivedAt`: `TEXT` → Unix milliseconds.
+- [x] Persistent SQLite connection и `busy_timeout`.
+- [x] Переиспользование `SocketAddress`.
+- [x] Версионирование Grafana dashboard.
 
-## 🟡 Milestone 4 — Production-readiness (v2.2, В РАБОТЕ)
+## ✅ Milestone 4 — Production-readiness (v2.2)
 
-По итогам аудита 2026-07-14. Блок P0 закрыт, P1/P2 в работе.
+Аудит ownership, batching, shutdown, storage isolation, HTTP lifecycle,
+конфигурации и устойчивости парсера завершён.
 
-### ✅ P0 — до любого запуска (ЗАКРЫТО)
-- [x] P0.1 Безопасное вытеснение — OwnedIngress с явным Dispose
-- [x] P0.2 Настоящее накопление batch — окно вместо snapshot-drain
-- [x] P0.3 Корректное завершение — доказано тестами (хвост + owners=0)
+### P0 — безопасность конвейера
 
-### 🔜 P1 — до объявления production-ready
-- [x] P1.1 Изоляция SQLite от Loki (primary/secondary sinks) — ЗАКРЫТО
-  Разорван `Task.WhenAll`: SQLite primary, Loki/Console best-effort с таймаутом.
-- [ ] P1.2 HTTP lifetime — Dispose response, timeout, retry-лимит, cancellation
-- [ ] P1.3 Валидация конфигурации при запуске — падать рано с понятной ошибкой
-- [ ] P1.4 Усиление парсера — битые дейтаграммы без падения
+- [x] P0.1 `OwnedIngress`: явное освобождение buffer вытесненной записи.
+- [x] P0.2 Windowed batching по `BatchSize` и `BatchTimeout`.
+- [x] P0.3 Graceful shutdown: сохранение хвоста и отсутствие утечек/double-dispose.
 
-### 🔮 P2 — эксплуатационная зрелость
-- [ ] P2.1 Метрики: received / parsed / sqlite_saved / channel_dropped
-- [ ] P2.2 Retention SQLite (автоочистка старых записей)
-- [ ] P2.3 Deployment hardening (systemd TimeoutStopSec, resource limits)
-- [ ] P2.4 Документация production-эксплуатации
+### P1 — production-readiness
 
-## 🔮 Milestone 5 — Экстремальная нагрузка (v3.0)
+- [x] P1.1 SQLite primary изолирован от best-effort Loki/Console secondaries.
+- [x] P1.2 HTTP lifetime `LokiLogSink`: response disposal, timeout,
+  ограниченный retry и корректная cancellation semantics.
+- [x] P1.3 Startup validation через `ValidateOnStart`, включая требование
+  ровно одного SQLite primary.
+- [x] P1.4 Parser hardening для повреждённых и обрезанных datagram.
 
-Цель: >100k pps. Оправдано только при реальной потребности.
+## 🟡 Milestone 5 — Эксплуатационная зрелость (В РАБОТЕ)
 
-- [ ] `SocketAsyncEventArgs` вместо `ReceiveFromAsync`
-  Исключает аллокацию на каждый вызов при приёме.
-- [ ] `System.IO.Pipelines` для TCP-транспорта
-- [ ] Оценка перехода на ClickHouse при retention >1 месяца
-- [ ] Горизонтальное масштабирование (несколько инстансов + Kafka)
+Текущий незарелизенный блок делает repository удобным для развёртывания
+и сопровождения, не меняя архитектуру горячего пути.
+
+### Завершено в `Unreleased`
+
+- [x] P2.3 Production, development и monitoring Docker Compose сценарии.
+- [x] P2.3 Non-root chiseled runtime, read-only root filesystem,
+  сброшенные capabilities и resource limits.
+- [x] P2.3 Исправленный systemd unit с `StateDirectory`, правильным SQLite path
+  и временем graceful shutdown.
+- [x] P2.4 Актуальные `README.md`, `DESIGN_GUIDE.md`, `DOCKER.md`
+  и `DOCKER-CHANGES.md`.
+- [x] Provisioning Loki datasource и Grafana dashboard.
+- [x] Очистка legacy Grafana-файлов и нормализация line endings через
+  `.gitattributes`.
+
+### Осталось
+
+- [ ] P2.1 Метрики: received / parsed / sqlite_saved / channel_dropped.
+- [ ] P2.2 Retention SQLite и контролируемая очистка старых записей.
+
+## 🔮 Milestone 6 — Экстремальная нагрузка (v3.0)
+
+Цель — нагрузки порядка `>100k pps`. Реализовывать только после измерений,
+подтверждающих необходимость.
+
+- [ ] `SocketAsyncEventArgs` вместо `ReceiveFromAsync`.
+- [ ] `System.IO.Pipelines` для будущего TCP-транспорта.
+- [ ] Оценка другого хранилища при объёмах, выходящих за разумные границы SQLite.
+- [ ] Горизонтальное масштабирование через durable broker.
 
 ---
 
-## Как это отслеживается
+## Как отслеживать работу
 
-Каждый milestone → GitHub Milestone. Каждый пункт → Issue с меткой
-(`bug` / `enhancement` / `performance`). Закрытые пункты ссылаются на
-commit или PR, который их реализовал.
+Каждый milestone оформляется как GitHub Milestone, а задача — как Issue с меткой
+`bug`, `enhancement`, `performance`, `operations` или `documentation`.
 
-Принцип приоритизации (из опыта проекта): исправления горячего пути
-(аллокации, блокировки) важнее холодных микрооптимизаций. Числа важнее
-предположений — каждый perf-пункт требует замера до и после.
+Закрытый пункт должен ссылаться на commit или pull request, который его реализовал.
+Оптимизации горячего пути выполняются только после измерения baseline и повторного
+замера результата.

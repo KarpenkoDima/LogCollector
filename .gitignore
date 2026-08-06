@@ -34,3 +34,9 @@ setup-git-history-existing.sh
 
 # JetBrains
 .idea/
+
+# Docker local state
+.env
+data/
+secrets/*
+!secrets/*.example

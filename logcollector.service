@@ -1,78 +1,99 @@
 # /etc/systemd/system/logcollector.service
 #
-# Installation:
+# The unit assumes a self-contained Linux publish in /opt/logcollector:
+#   dotnet publish LogCollector.Host/LogCollector.Host.csproj \
+#     -c Release -r linux-x64 --self-contained true \
+#     -o /opt/logcollector
+#
+# Create the dedicated account once:
+#   sudo useradd --system --home-dir /nonexistent \
+#     --shell /usr/sbin/nologin logcollector
+#
+# Install and validate:
 #   sudo cp logcollector.service /etc/systemd/system/
+#   sudo systemd-analyze verify /etc/systemd/system/logcollector.service
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now logcollector
 #
-# Logs:
+# Logs and status:
 #   journalctl -u logcollector -f
-#
-# Status:
 #   systemctl status logcollector
 
 [Unit]
-Description=LogCollector — Syslog ingestion from MikroTik and Windows machines
-# Start only after the network stack is available.
-# "network-online.target" would wait for an IP address; "network.target"
-# is sufficient since we're binding a server socket (not making outbound connections).
+Description=LogCollector - MikroTik BSD Syslog collector
 After=network.target
-# Restart if the SQLite directory is a separate mount (NFS, external drive)
-# by adding: After=var-log-logcollector.mount
+StartLimitIntervalSec=60s
+StartLimitBurst=3
 
 [Service]
+# AddSystemd() sends READY=1 after the Generic Host start sequence completes.
+# The current application has no dedicated readiness probe that independently
+# verifies UDP receive, SQLite writes and the batch consumer after startup.
 Type=notify
-# "notify" means systemd waits for sd_notify("READY=1") before declaring the
-# service started.  AddSystemd() in Program.cs sends this signal automatically
-# once all IHostedService.StartAsync calls complete — i.e., once the UDP socket
-# is bound and the SQLite schema is verified.  Without this, systemd would report
-# the service as "active" before the listener is actually ready.
+NotifyAccess=main
 
 ExecStart=/opt/logcollector/LogCollector.Host
 WorkingDirectory=/opt/logcollector
 
-# Run under a dedicated, unprivileged system account.
-# Create it once with: sudo useradd -r -s /sbin/nologin logcollector
 User=logcollector
 Group=logcollector
+UMask=0027
 
-# Give the binary the ability to bind port 514 without running as root.
-# This is the recommended alternative to "User=root".
-# It grants only the specific capability needed, nothing else.
+# StateDirectory creates /var/lib/logcollector with the service account as owner.
+# SQLite, WAL and SHM files are written only inside this directory.
+StateDirectory=logcollector
+StateDirectoryMode=0750
+
+# Real configuration keys used by the current C# implementation.
+Environment=DOTNET_ENVIRONMENT=Production
+Environment=SyslogListener__Port=514
+Environment=LogSinks__0__Type=Sqlite
+Environment="LogSinks__0__ConnectionString=Data Source=/var/lib/logcollector/logs.db;Cache=Shared"
+
+# Optional local overrides. Example variables:
+#   BatchWriter__BatchSize=1000
+#   BatchWriter__BatchTimeout=00:00:01
+#   LogSinks__1__Type=Loki
+#   LogSinks__1__Endpoint=http://127.0.0.1:3100
+EnvironmentFile=-/etc/logcollector/logcollector.env
+
+# The process binds standard syslog port 514 without running as root.
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
-# If you prefer NOT to use capabilities, comment out the two lines above
-# and instead redirect port 514 at the firewall level (set Port=5140 in config):
-#   sudo iptables -t nat -A PREROUTING -p udp --dport 514 -j REDIRECT --to-port 5140
-#   sudo ip6tables -t nat -A PREROUTING -p udp --dport 514 -j REDIRECT --to-port 5140
-
-# ── Reliability ───────────────────────────────────────────────────────────────
+# Reliability and graceful shutdown.
 Restart=on-failure
-RestartSec=5
-# Allow up to 3 restarts in 60 seconds before systemd gives up.
-StartLimitInterval=60
-StartLimitBurst=3
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=45s
+KillSignal=SIGTERM
 
-# Give the service up to 10 seconds to drain the channel on SIGTERM.
-# After this, systemd sends SIGKILL.  The BatchWriterService drain phase
-# typically completes in < 1 second unless SQLite is under heavy I/O pressure.
-TimeoutStopSec=10
-
-# ── Environment ───────────────────────────────────────────────────────────────
-Environment=DOTNET_ENVIRONMENT=Production
-
-# Example: override the SQLite path without editing appsettings.json.
-# Environment=BATCHWRITER__CONNECTIONSTRING=Data Source=/mnt/nas/logs.db
-
-# ── Security hardening ────────────────────────────────────────────────────────
+# Security hardening. Do not enable MemoryDenyWriteExecute: the .NET JIT needs
+# executable memory. StateDirectory remains writable with ProtectSystem=strict.
 NoNewPrivileges=yes
 PrivateTmp=yes
-# Protect the system filesystem from writes; explicitly allow only the log dir.
+PrivateDevices=yes
 ProtectSystem=strict
-ReadWritePaths=/var/log/logcollector
-# Prevent the service from writing to /home directories.
 ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/logcollector
+
+# Resource safety limits. These are guardrails, not throughput targets.
+TasksMax=256
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=logcollector
 
 [Install]
 WantedBy=multi-user.target

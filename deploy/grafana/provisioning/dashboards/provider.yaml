@@ -2,10 +2,12 @@ apiVersion: 1
 
 providers:
   - name: LogCollector
+    orgId: 1
     folder: LogCollector
     type: file
     disableDeletion: true
+    allowUiUpdates: false
     updateIntervalSeconds: 30
     options:
-      path: /etc/grafana/provisioning/dashboards
+      path: /var/lib/grafana/dashboards
       foldersFromFilesStructure: false

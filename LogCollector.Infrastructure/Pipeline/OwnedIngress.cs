@@ -1,5 +1,6 @@
 using System.Threading.Channels;
 using LogCollector.Core.Domain;
+using LogCollector.Infrastructure.Diagnostics;
 
 namespace LogCollector.Infrastructure.Pipeline;
 
@@ -29,10 +30,14 @@ public sealed class OwnedIngress : IOwnedIngress
 {
     private readonly Channel<LogEntry> _channel;
     private readonly object _enqueueLock = new();
+    private readonly LogCollectorMetrics? _metrics;
     private long _droppedCount;
 
-    public OwnedIngress(int capacity)
+    // metrics опционален: существующие вызовы new OwnedIngress(capacity) и тесты
+    // P0.1 продолжают работать без метрик. В production DI передаёт реальный экземпляр.
+    public OwnedIngress(int capacity, LogCollectorMetrics? metrics = null)
     {
+        _metrics = metrics;
         _channel = Channel.CreateBounded<LogEntry>(
             new BoundedChannelOptions(capacity)
             {
@@ -41,6 +46,9 @@ public sealed class OwnedIngress : IOwnedIngress
                 SingleReader = false, // consumer + eviction оба читают
                 SingleWriter = false, // listener + Complete из разных потоков
             });
+
+        // channel_depth gauge читает текущий backlog при каждом scrape.
+        _metrics?.BindChannelDepth(() => _channel.Reader.Count);
     }
 
     public ChannelReader<LogEntry> Reader => _channel.Reader;
@@ -61,6 +69,7 @@ public sealed class OwnedIngress : IOwnedIngress
             {
                 evicted.RawBuffer?.Dispose();       // ← фикс P0.1: явный Dispose
                 Interlocked.Increment(ref _droppedCount);
+                _metrics?.RecordDropped();          // ← P2.1: метрика вытеснения
             }
 
             // После вытеснения место освободилось — запись должна пройти.
@@ -73,6 +82,7 @@ public sealed class OwnedIngress : IOwnedIngress
             // Чтобы не потерять владение — диспозим новый буфер и сообщаем drop.
             entry.RawBuffer?.Dispose();
             Interlocked.Increment(ref _droppedCount);
+            _metrics?.RecordDropped();              // ← P2.1: метрика вытеснения
             return EnqueueResult.DroppedOldest;
         }
     }

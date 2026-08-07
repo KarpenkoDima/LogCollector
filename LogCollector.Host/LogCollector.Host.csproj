@@ -33,6 +33,16 @@
     -->
     <PackageReference Include="Microsoft.Extensions.Hosting"        Version="9.0.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="9.0.0" />
+
+    <!--
+      OpenTelemetry (P2.1): reads the "LogCollector" Meter and exposes it on a
+      Prometheus scrape endpoint. The HttpListener exporter is a standalone HTTP
+      server — it does NOT pull in ASP.NET/Kestrel, keeping this console worker
+      minimal.
+    -->
+    <PackageReference Include="OpenTelemetry"                                  Version="1.9.0" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting"               Version="1.9.0" />
+    <PackageReference Include="OpenTelemetry.Exporter.Prometheus.HttpListener" Version="1.9.0-beta.2" />
   </ItemGroup>
 
   <ItemGroup>

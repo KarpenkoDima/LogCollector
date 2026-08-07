@@ -3,6 +3,7 @@ using LogCollector.Application.Interfaces;
 using LogCollector.Core.Domain;
 using LogCollector.Infrastructure.Listeners;
 using LogCollector.Infrastructure.Parsers;
+using LogCollector.Infrastructure.Diagnostics;
 using LogCollector.Infrastructure.Pipeline;
 using LogCollector.Infrastructure.Sinks;
 using Microsoft.Extensions.Configuration;
@@ -150,7 +151,12 @@ public static class ServiceCollectionExtensions
         // вытеснял LogEntry, НЕ вызывая RawBuffer.Dispose() — утечка pool-буферов
         // под нагрузкой. OwnedIngress реализует drop-oldest ЯВНО, с Dispose
         // вытесняемого буфера ровно один раз. Политика «freshest wins» сохранена.
-        services.AddSingleton<IOwnedIngress>(_ => new OwnedIngress(capacity: 10_000));
+        // P2.1: единый владелец Meter и всех метрик — singleton.
+        services.AddSingleton<LogCollectorMetrics>();
+
+        services.AddSingleton<IOwnedIngress>(sp => new OwnedIngress(
+            capacity: 10_000,
+            sp.GetRequiredService<LogCollectorMetrics>()));
 
         // Reader для BatchWriterService — берём из ingress, сигнатура сервиса
         // не меняется (он по-прежнему принимает ChannelReader<LogEntry>).

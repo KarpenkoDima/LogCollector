@@ -1,5 +1,6 @@
 using LogCollector.Infrastructure;
 using Microsoft.Extensions.Hosting;
+using OpenTelemetry.Metrics;
 
 // ── Composition Root ──────────────────────────────────────────────────────────
 //
@@ -59,6 +60,29 @@ builder.Services.AddSystemd();
 // BatchWriterService registers first → stops last (drains the channel).
 // UdpSyslogListener registers second → stops first (stops producing).
 builder.Services.AddLogCollectorInfrastructure(builder.Configuration);
+
+// ── Metrics export (P2.1) ─────────────────────────────────────────────────────
+//
+// OpenTelemetry subscribes to the "LogCollector" Meter (owned by
+// LogCollectorMetrics, a singleton registered inside the call above) and exposes
+// every instrument on a Prometheus scrape endpoint.
+//
+// The Prometheus HttpListener exporter is a standalone HTTP server — it does NOT
+// bring in ASP.NET/Kestrel, keeping this console worker minimal. Prometheus (or
+// Grafana Agent) scrapes http://<host>:9464/metrics on an interval.
+//
+// Port 9464 is the OpenTelemetry default. In a container bind to all interfaces
+// ("+") so the endpoint is reachable from the host; on a dev machine "localhost"
+// suffices. Controlled via config key "Metrics:PrometheusPrefix"
+// (env: METRICS__PROMETHEUSPREFIX).
+var prometheusPrefix = builder.Configuration["Metrics:PrometheusPrefix"]
+    ?? "http://localhost:9464/";
+
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(metrics => metrics
+        .AddMeter("LogCollector")
+        .AddPrometheusHttpListener(options =>
+            options.UriPrefixes = new[] { prometheusPrefix }));
 
 // ── Run ────────────────────────────────────────────────────────────────────────
 //

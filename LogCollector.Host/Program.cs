@@ -1,5 +1,7 @@
 using LogCollector.Infrastructure;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using OpenTelemetry;
 using OpenTelemetry.Metrics;
 
 // ── Composition Root ──────────────────────────────────────────────────────────
@@ -78,11 +80,17 @@ builder.Services.AddLogCollectorInfrastructure(builder.Configuration);
 var prometheusPrefix = builder.Configuration["Metrics:PrometheusPrefix"]
     ?? "http://localhost:9464/";
 
-builder.Services.AddOpenTelemetry()
-    .WithMetrics(metrics => metrics
-        .AddMeter("LogCollector")
-        .AddPrometheusHttpListener(options =>
-            options.UriPrefixes = new[] { prometheusPrefix }));
+// Sdk.CreateMeterProviderBuilder() — низкоуровневый API из пакета OpenTelemetry,
+// не зависит от hosting-интеграции. Создаём MeterProvider, подписанный на наш
+// Meter "LogCollector", с Prometheus HttpListener экспортом. Регистрируем как
+// singleton, чтобы provider жил всё время работы Host и корректно освобождался.
+var meterProvider = Sdk.CreateMeterProviderBuilder()
+    .AddMeter("LogCollector")
+    .AddPrometheusHttpListener(options =>
+        options.UriPrefixes = new[] { prometheusPrefix })
+    .Build();
+
+builder.Services.AddSingleton(meterProvider);
 
 // ── Run ────────────────────────────────────────────────────────────────────────
 //

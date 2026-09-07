@@ -27,6 +27,9 @@ services:
       # host 514/udp -> container 5140/udp
       # Для rootless Docker задайте SYSLOG_HOST_PORT=5140 в .env.
       - "${SYSLOG_HOST_IP:-0.0.0.0}:${SYSLOG_HOST_PORT:-514}:5140/udp"
+      # Prometheus metrics endpoint (P2.1): host 9464 -> container 9464.
+      # curl http://localhost:9464/metrics для проверки.
+      - "${METRICS_HOST_IP:-127.0.0.1}:${METRICS_HOST_PORT:-9464}:9464/tcp"
 
     environment:
       DOTNET_ENVIRONMENT: Production
@@ -39,6 +42,10 @@ services:
 
       BatchWriter__BatchSize: "500"
       BatchWriter__BatchTimeout: "00:00:02"
+
+      # P2.1: Prometheus exporter слушает все интерфейсы контейнера (+),
+      # чтобы endpoint был доступен через проброс порта на хост.
+      Metrics__PrometheusPrefix: "http://+:9464/"
 
       # SQLite — обязательный PRIMARY sink. Loki добавляется только monitoring-файлом.
       LogSinks__0__Type: Sqlite

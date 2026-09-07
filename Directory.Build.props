@@ -1,0 +1,23 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!--
+      TreatWarningsAsErrors keeps real compiler warnings fatal (nullable misuse,
+      unused code, unreachable branches) — these catch actual bugs.
+
+      Code-analysis (CAxxxx) is enabled at latest-recommended for visibility, but
+      NOT promoted to errors: those rules are largely stylistic/micro-optimisation
+      (LoggerMessage delegates, ToString culture, benchmark method naming) and
+      should be addressed as a deliberate cleanup task, not block every build.
+      Promote specific CA rules to errors later, one at a time, as they're fixed.
+    -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+
+    <!-- CA analysis stays as warnings, not errors (see rationale above). -->
+    <CodeAnalysisTreatWarningsAsErrors>false</CodeAnalysisTreatWarningsAsErrors>
+  </PropertyGroup>
+</Project>

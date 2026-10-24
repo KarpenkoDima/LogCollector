@@ -82,9 +82,11 @@ public sealed partial class BatchProcessor
         }
         finally
         {
-            if (cancelledForShutdown)
+            if (cancelledForShutdown || cancellationToken.IsCancellationRequested)
             {
-                await FlushPendingOnShutdownAsync(batch, reader).ConfigureAwait(false);
+                if (!cancelledForShutdown) LogShutdownStarted(_logger);
+
+        	await FlushPendingOnShutdownAsync(batch, reader).ConfigureAwait(false);
             }
             else
             {

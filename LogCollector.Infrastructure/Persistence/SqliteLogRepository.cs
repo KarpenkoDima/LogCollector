@@ -101,18 +101,28 @@ public sealed class SqliteLogRepository : ILogRepository
             };
         }
 
-        await using SqliteTransaction transaction =
-            (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken)
-                .ConfigureAwait(false);
+        try
+        {
+            await using SqliteTransaction transaction =
+                (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken)
+                    .ConfigureAwait(false);
 
-        await connection.ExecuteAsync(new CommandDefinition(
-            InsertSql,
-            rows,
-            transaction,
-            commandType: CommandType.Text,
-            cancellationToken: cancellationToken)).ConfigureAwait(false);
+            await connection.ExecuteAsync(new CommandDefinition(
+                InsertSql,
+                rows,
+                transaction,
+                commandType: CommandType.Text,
+                cancellationToken: cancellationToken)).ConfigureAwait(false);
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (SqliteException exception) when (exception.SqliteErrorCode is 5 or 6)
+        {
+            // SQLite result codes 5 and 6 are SQLITE_BUSY and SQLITE_LOCKED. These are
+            // the storage failures for which retrying the whole transaction is appropriate.
+            throw new TransientLogPersistenceException(
+                "SQLite is busy or locked; the batch can be retried.", exception);
+        }
     }
 
     public async ValueTask DisposeAsync()

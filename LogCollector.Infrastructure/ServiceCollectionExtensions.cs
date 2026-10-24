@@ -10,6 +10,7 @@ using LogCollector.Infrastructure.Persistence;
 using LogCollector.Infrastructure.Pipeline;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace LogCollector.Infrastructure;
@@ -30,6 +31,11 @@ public static class ServiceCollectionExtensions
                 "Pipeline:FlushInterval must be positive.")
             .Validate(options => options.RetryDelay > TimeSpan.Zero,
                 "Pipeline:RetryDelay must be positive.")
+            .Validate(options => options.MaxAttempts is >= 1 and <= 10,
+                "Pipeline:MaxAttempts must be between 1 and 10.")
+            .Validate(options => options.ShutdownFlushTimeout > TimeSpan.Zero &&
+                options.ShutdownFlushTimeout < TimeSpan.FromSeconds(30),
+                "Pipeline:ShutdownFlushTimeout must be positive and less than HostOptions.ShutdownTimeout (30 seconds).")
             .ValidateOnStart();
 
         services.AddOptions<UdpListenerOptions>()
@@ -107,7 +113,8 @@ public static class ServiceCollectionExtensions
         services.AddSingleton(provider => provider.GetRequiredService<Channel<LogEntry>>().Writer);
         services.AddSingleton(provider => new BatchProcessor(
             provider.GetRequiredService<ILogRepository>(),
-            provider.GetRequiredService<IOptions<BatchProcessorOptions>>().Value));
+            provider.GetRequiredService<IOptions<BatchProcessorOptions>>().Value,
+            provider.GetRequiredService<ILogger<BatchProcessor>>()));
 
         // Registration order is deliberate: the listener stops first and completes
         // the channel; the writer then drains it before the host exits.

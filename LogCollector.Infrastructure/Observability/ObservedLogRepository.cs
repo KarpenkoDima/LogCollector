@@ -6,7 +6,7 @@ namespace LogCollector.Infrastructure.Observability;
 
 /// <summary>
 /// Writes to the durable primary repository first, then publishes to best-effort observers.
-/// This ordering prevents a Loki outage from blocking SQLite or duplicating its rows on retry.
+/// Observer failures never turn an already committed primary write into a failed batch.
 /// </summary>
 public sealed partial class ObservedLogRepository : ILogRepository
 {
@@ -39,12 +39,11 @@ public sealed partial class ObservedLogRepository : ILogRepository
             {
                 await observer.PublishBatchAsync(entries, cancellationToken).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
             catch (Exception exception)
             {
+                // The primary write has already committed. Cancellation of a best-effort
+                // observer must not make the batch look uncommitted to BatchProcessor,
+                // otherwise a shutdown retry could insert the same SQLite rows twice.
                 LogObserverFailure(_logger, observer.GetType().Name, exception);
             }
         }
